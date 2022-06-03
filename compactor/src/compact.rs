@@ -361,9 +361,9 @@ impl Compactor {
 
     /// Group files to be compacted together and level-0 files that will get upgraded
     /// for a given partition.
-    /// If split_large_overlaps is false, all overlapped files will be in the same group no matter
-    /// how many and how larg ethey are. Otherwise, he number of compacting files per group will be
-    /// limited by thier total size and number of files
+    /// If compaction_split_large_overlaps is false, all overlapped files will be in the same group no matter
+    /// how many and how large they are. Otherwise, the number of compacting files per group will be
+    /// limited by their total size and number of files
     pub async fn groups_to_compact_and_files_to_upgrade(
         &self,
         partition_id: PartitionId,
