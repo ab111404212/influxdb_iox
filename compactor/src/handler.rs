@@ -114,6 +114,9 @@ pub struct CompactorConfig {
     compaction_max_size_bytes: i64,
     /// Limit the number of files to compact into one file
     compaction_max_file_count: i64,
+    /// If true the compactor will split many overlapped files of a group into smaller groups if their total
+    /// size is larger than compaction_max_size_bytes or thier number of files is larger than compaction_max_file_count
+    compaction_split_large_overlaps: i32,
 }
 
 impl CompactorConfig {
@@ -123,6 +126,7 @@ impl CompactorConfig {
         max_concurrent_compaction_size_bytes: i64,
         compaction_max_size_bytes: i64,
         compaction_max_file_count: i64,
+        compaction_split_large_overlaps: i32,
     ) -> Self {
         assert!(split_percentage > 0 && split_percentage <= 100);
 
@@ -131,6 +135,7 @@ impl CompactorConfig {
             max_concurrent_compaction_size_bytes,
             compaction_max_size_bytes,
             compaction_max_file_count,
+            compaction_split_large_overlaps,
         }
     }
 
@@ -159,6 +164,11 @@ impl CompactorConfig {
     pub fn compaction_max_file_count(&self) -> i64 {
         self.compaction_max_file_count
     }
+
+    /// Split the group of large and/or many overlapped files or not
+    pub fn compaction_split_large_overlaps(&self) -> bool {
+        self.compaction_split_large_overlaps != 0
+    }
 }
 
 /// Checks for candidate partitions to compact and spawns tokio tasks to compact as many
@@ -180,6 +190,7 @@ async fn run_compactor(compactor: Arc<Compactor>, shutdown: CancellationToken) {
         let max_size = compactor.config.max_concurrent_compaction_size_bytes();
         let max_file_size = compactor.config.compaction_max_size_bytes();
         let max_file_count = compactor.config.compaction_max_file_count();
+        let split_large_overlaps = compactor.config.compaction_split_large_overlaps();
         let mut handles = vec![];
 
         for c in candidates {
@@ -187,6 +198,7 @@ async fn run_compactor(compactor: Arc<Compactor>, shutdown: CancellationToken) {
             let compact_and_upgrade = compactor
                 .groups_to_compact_and_files_to_upgrade(
                     c.partition_id,
+                    split_large_overlaps,
                     max_file_size,
                     max_file_count,
                 )

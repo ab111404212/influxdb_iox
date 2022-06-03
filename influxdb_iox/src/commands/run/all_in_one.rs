@@ -371,6 +371,7 @@ impl Config {
             max_concurrent_compaction_size_bytes: 100000,
             compaction_max_size_bytes: 100000,
             compaction_max_file_count: 10,
+            compaction_split_large_overlaps: 1,
         };
 
         let querier_config = QuerierConfig {

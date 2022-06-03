@@ -62,4 +62,14 @@ pub struct CompactorConfig {
         default_value = "100"
     )]
     pub compaction_max_file_count: i64,
+
+    /// If true split a group of many or large overlapped files into smaller groups based on
+    /// INFLUXDB_IOX_COMPACTION_MAX_SIZE_BYTE and
+    /// Default is 0 which means false
+    #[clap(
+        long = "--compaction-split-large-overlaps",
+        env = "INFLUXDB_IOX_COMPACTION_SPLIT_LARGE_OVERLAPS",
+        default_value = "0"
+    )]
+    pub compaction_split_large_overlaps: i32,
 }

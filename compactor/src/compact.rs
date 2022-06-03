@@ -361,10 +361,13 @@ impl Compactor {
 
     /// Group files to be compacted together and level-0 files that will get upgraded
     /// for a given partition.
-    /// The number of compacting files per group will be limited by thier total size and number of files
+    /// If split_large_overlaps is false, all overlapped files will be in the same group no matter
+    /// how many and how larg ethey are. Otherwise, he number of compacting files per group will be
+    /// limited by thier total size and number of files
     pub async fn groups_to_compact_and_files_to_upgrade(
         &self,
         partition_id: PartitionId,
+        compaction_split_large_overlaps: bool,
         compaction_max_size_bytes: i64, // max size of files to get compacted
         compaction_max_file_count: i64, // max number of files to get compacted
     ) -> Result<CompactAndUpgrade> {
@@ -389,12 +392,12 @@ impl Compactor {
         // Each group will be limited by thier size and number of files
         let overlapped_file_groups = Self::overlapped_groups(
             parquet_files,
+            compaction_split_large_overlaps,
             compaction_max_size_bytes,
             compaction_max_file_count,
         );
 
         // Group time-contiguous non-overlapped groups if their total size is smaller than a threshold
-        // If their
         let compact_file_groups = Self::group_small_contiguous_groups(
             overlapped_file_groups,
             compaction_max_size_bytes,
@@ -883,10 +886,11 @@ impl Compactor {
 
     // Given a list of parquet files that come from the same Table Partition, group files together
     // if their (min_time, max_time) ranges overlap. Does not preserve or guarantee any ordering.
-    // If there are so mnay files in an overlapped group, the group will be split to ensure each
-    // group contains limited number of files
+    // If split_large_overlaps is true, each overalpped group will be split further based on max_size_bytes and
+    // max_file_count
     fn overlapped_groups(
         parquet_files: Vec<ParquetFileWithMetadata>,
+        split_large_overlaps: bool,
         max_size_bytes: i64,
         max_file_count: i64,
     ) -> Vec<GroupWithMinTimeAndSize> {
@@ -894,9 +898,14 @@ impl Compactor {
         let mut overlapped_groups =
             group_potential_duplicates(parquet_files).expect("Error grouping overlapped chunks");
 
-        // split overlapped groups into smalller groups if they include so many files
-        let overlapped_groups =
-            Self::split_overlapped_groups(&mut overlapped_groups, max_size_bytes, max_file_count);
+        if split_large_overlaps {
+            // split overlapped groups into smalller groups if they include so many files
+            overlapped_groups = Self::split_overlapped_groups(
+                &mut overlapped_groups,
+                max_size_bytes,
+                max_file_count,
+            );
+        }
 
         // Compute min time and total size for each overlapped group
         let mut groups_with_min_time_and_size = Vec::with_capacity(overlapped_groups.len());
@@ -1179,13 +1188,14 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 1),
             Arc::new(metric::Registry::new()),
         );
 
         let compact_and_upgrade = compactor
             .groups_to_compact_and_files_to_upgrade(
                 partition.partition.id,
+                compactor.config.compaction_split_large_overlaps(),
                 compactor.config.compaction_max_size_bytes(),
                 compactor.config.compaction_max_file_count(),
             )
@@ -1324,7 +1334,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 1),
             Arc::new(metric::Registry::new()),
         );
 
@@ -1410,6 +1420,7 @@ mod tests {
         let compact_and_upgrade = compactor
             .groups_to_compact_and_files_to_upgrade(
                 partition.partition.id,
+                compactor.config.compaction_split_large_overlaps(),
                 compactor.config.compaction_max_size_bytes(),
                 compactor.config.compaction_max_file_count(),
             )
@@ -1526,7 +1537,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -1634,7 +1645,7 @@ mod tests {
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
             // split_percentage = 100 which means no split
-            CompactorConfig::new(100, 100000, 100000, 10),
+            CompactorConfig::new(100, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -1727,7 +1738,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -1846,7 +1857,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -2032,6 +2043,7 @@ mod tests {
 
         let groups = Compactor::overlapped_groups(
             vec![pf1.clone(), pf2.clone()],
+            false,
             TEST_MAX_SIZE_BYTES,
             TEST_MAX_FILE_COUNT,
         );
@@ -2051,6 +2063,7 @@ mod tests {
 
         let groups = Compactor::overlapped_groups(
             vec![pf1.clone(), pf2.clone()],
+            true,
             TEST_MAX_SIZE_BYTES,
             TEST_MAX_FILE_COUNT,
         );
@@ -2092,7 +2105,7 @@ mod tests {
         ];
 
         let mut groups =
-            Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+            Compactor::overlapped_groups(all, true, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         dbg!(&groups);
 
         assert_eq!(groups.len(), 3);
@@ -2155,6 +2168,7 @@ mod tests {
 
         let overlapped_groups = Compactor::overlapped_groups(
             vec![pf1.clone(), pf2.clone()],
+            false,
             TEST_MAX_SIZE_BYTES,
             TEST_MAX_FILE_COUNT,
         );
@@ -2288,7 +2302,9 @@ mod tests {
         // Group into overlapped groups
         let max_size_bytes = 1000;
         let max_file_count = 2;
-        let overlapped_groups = Compactor::overlapped_groups(all, max_size_bytes, max_file_count);
+        // split_large_overlaps = true -> split further using max_size_bytes and max_file_count
+        let overlapped_groups =
+            Compactor::overlapped_groups(all, true, max_size_bytes, max_file_count);
         // Must be 5
         assert_eq!(overlapped_groups.len(), 5);
         assert_eq!(overlapped_groups[0].parquet_files.len(), 2); // reach limit file count
@@ -2329,6 +2345,76 @@ mod tests {
     // This tests
     //   1. overlapped_groups which focuses on the detail of both its children:
     //      1.a. group_potential_duplicates that groups files into overlapped groups
+    //      1.b. test NOT split_overlapped_groups
+    //   2. group_small_contiguous_groups that merges non-overlapped group into a larger one if they meet size and file limit
+    #[test]
+    fn test_no_use_limit_size_and_num_files() {
+        let compaction_max_size_bytes = 100000;
+
+        // oldest overlapped and very small
+        let overlaps_many = arbitrary_parquet_file_with_size(5, 10, 400);
+        let contained_completely_within = arbitrary_parquet_file_with_size(6, 7, 500);
+        let max_equals_min = arbitrary_parquet_file_with_size(3, 5, 400);
+        let min_equals_max = arbitrary_parquet_file_with_size(10, 12, 500);
+
+        // newest files and very large
+        let alone = arbitrary_parquet_file_with_size(30, 35, compaction_max_size_bytes + 200); // too large to group
+
+        // small files in  the middle
+        let another = arbitrary_parquet_file_with_size(13, 15, 1000);
+        let partial_overlap = arbitrary_parquet_file_with_size(14, 16, 2000);
+
+        // Given a bunch of files in an arbitrary order,
+        let all = vec![
+            min_equals_max.clone(),
+            overlaps_many.clone(),
+            alone.clone(),
+            another.clone(),
+            max_equals_min.clone(),
+            contained_completely_within.clone(),
+            partial_overlap.clone(),
+        ];
+
+        // Group into overlapped groups
+        let max_size_bytes = 1000;
+        let max_file_count = 2;
+        // split_large_overlaps = false -> NOT split further
+        let overlapped_groups =
+            Compactor::overlapped_groups(all, false, max_size_bytes, max_file_count);
+        // Must be 3 overlapped groups
+        assert_eq!(overlapped_groups.len(), 3);
+        assert_eq!(overlapped_groups[0].parquet_files.len(), 4); // first/oldest overlapped group
+        assert_eq!(overlapped_groups[1].parquet_files.len(), 2); // second/middle overlapped group
+        assert_eq!(overlapped_groups[2].parquet_files.len(), 1); // last/newest overlapped group
+
+        // Group further into group by size and file count limit
+        // Due to the merge with correct time range, this function has to sort the groups hence output data will be in time order
+        let groups = Compactor::group_small_contiguous_groups(
+            overlapped_groups,
+            compaction_max_size_bytes,
+            max_file_count,
+        );
+
+        // Must still be 3 groups. Nothing is merged due to the limit of size and file num
+        assert_eq!(groups.len(), 3);
+
+        assert_eq!(groups[0].len(), 4);
+        assert!(groups[0].contains(&max_equals_min)); // min_time = 3
+        assert!(groups[0].contains(&overlaps_many)); // min_time = 5
+        assert!(groups[0].contains(&contained_completely_within)); // min_time = 6
+        assert!(groups[0].contains(&min_equals_max)); // min_time = 10
+
+        assert_eq!(groups[1].len(), 2);
+        assert!(groups[1].contains(&another)); // min_time = 13
+        assert!(groups[1].contains(&partial_overlap)); // min_time = 14
+
+        assert_eq!(groups[2].len(), 1);
+        assert!(groups[2].contains(&alone));
+    }
+
+    // This tests
+    //   1. overlapped_groups which focuses on the detail of both its children:
+    //      1.a. group_potential_duplicates that groups files into overlapped groups
     //      1.b. split_overlapped_groups that splits each overlapped group further to meet size and/or file limit
     //   2. group_small_contiguous_groups that merges non-overlapped group into a larger one if they meet size and file limit
     #[test]
@@ -2341,6 +2427,7 @@ mod tests {
 
         let overlapped_groups = Compactor::overlapped_groups(
             vec![pf1.clone(), pf2.clone()],
+            true,
             TEST_MAX_SIZE_BYTES,
             TEST_MAX_FILE_COUNT,
         );
@@ -2405,7 +2492,7 @@ mod tests {
 
         // Group into overlapped groups
         let overlapped_groups =
-            Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+            Compactor::overlapped_groups(all, true, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         assert_eq!(overlapped_groups.len(), 3);
 
         // group further into group by size
@@ -2462,7 +2549,7 @@ mod tests {
 
         // Group into overlapped groups
         let overlapped_groups =
-            Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+            Compactor::overlapped_groups(all, true, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         assert_eq!(overlapped_groups.len(), 5);
 
         // 5 input groups and 5 output groups because they are too large to group further
@@ -2520,7 +2607,7 @@ mod tests {
 
         // Group into overlapped groups
         let overlapped_groups =
-            Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+            Compactor::overlapped_groups(all, true, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         assert_eq!(overlapped_groups.len(), 4);
 
         // 4 input groups but 3 output groups
@@ -2558,7 +2645,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -2731,7 +2818,8 @@ mod tests {
         // Given a bunch of files in a particular order to exercise the algorithm:
         let all = vec![one, two, three];
 
-        let groups = Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+        let groups =
+            Compactor::overlapped_groups(all, true, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         dbg!(&groups);
 
         // All should be in the same group.
@@ -2745,7 +2833,8 @@ mod tests {
         // Given a bunch of files in a particular order to exercise the algorithm:
         let all = vec![one, two, three, four];
 
-        let groups = Compactor::overlapped_groups(all, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
+        let groups =
+            Compactor::overlapped_groups(all, false, TEST_MAX_SIZE_BYTES, TEST_MAX_FILE_COUNT);
         dbg!(&groups);
 
         // All should be in the same group.
@@ -2763,7 +2852,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -3090,7 +3179,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
@@ -3164,7 +3253,7 @@ mod tests {
             Arc::new(Executor::new(1)),
             Arc::new(SystemProvider::new()),
             BackoffConfig::default(),
-            CompactorConfig::new(90, 100000, 100000, 10),
+            CompactorConfig::new(90, 100000, 100000, 10, 0),
             Arc::new(metric::Registry::new()),
         );
 
