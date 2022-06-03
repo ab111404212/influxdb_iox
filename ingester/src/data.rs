@@ -36,6 +36,9 @@ use std::{
 use uuid::Uuid;
 use write_summary::SequencerProgress;
 
+mod triggers;
+use self::triggers::TestTriggers;
+
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
@@ -434,6 +437,7 @@ impl SequencerData {
         partitioner: &dyn Partitioner,
         executor: &Executor,
     ) -> Result<bool> {
+        debug!(?sequencer_id, "buffer operation");
         let namespace_data = match self.namespace(dml_operation.namespace()) {
             Some(d) => d,
             None => {
@@ -441,6 +445,7 @@ impl SequencerData {
                     .await?
             }
         };
+        debug!(?sequencer_id, "got namespace");
 
         namespace_data
             .buffer_operation(
@@ -512,6 +517,9 @@ pub struct NamespaceData {
 
     /// The sequence number being actively written, if any
     buffering_sequence_number: RwLock<Option<SequenceNumber>>,
+
+    /// Control the flow of ingest, for testing purposes
+    test_triggers: TestTriggers,
 }
 
 impl NamespaceData {
@@ -529,6 +537,7 @@ impl NamespaceData {
             tables: Default::default(),
             table_count,
             buffering_sequence_number: RwLock::new(None),
+            test_triggers: TestTriggers::new(),
         }
     }
 
@@ -543,6 +552,7 @@ impl NamespaceData {
             tables: RwLock::new(tables),
             table_count: Default::default(),
             buffering_sequence_number: RwLock::new(None),
+            test_triggers: TestTriggers::new(),
         }
     }
 
@@ -566,6 +576,8 @@ impl NamespaceData {
         let sequence_number = i64::try_from(sequence_number).expect("sequence out of bounds");
         let sequence_number = SequenceNumber::new(sequence_number);
 
+        debug!(?sequence_number, "buffering operation in namespace");
+
         // Note that this namespace is actively writing this sequence
         // number. Since there is no namespace wide lock held during a
         // write, this number is used to detect and update reported
@@ -583,19 +595,22 @@ impl NamespaceData {
                         None => self.insert_table(sequencer_id, &t, catalog).await?,
                     };
 
-                    let mut table_data = table_data.write().await;
-                    let should_pause = table_data
-                        .buffer_table_write(
-                            sequence_number,
-                            b,
-                            sequencer_id,
-                            catalog,
-                            lifecycle_handle,
-                            partitioner,
-                        )
-                        .await?;
-
-                    pause_writes = pause_writes || should_pause;
+                    {
+                        // lock scope
+                        let mut table_data = table_data.write().await;
+                        let should_pause = table_data
+                            .buffer_table_write(
+                                sequence_number,
+                                b,
+                                sequencer_id,
+                                catalog,
+                                lifecycle_handle,
+                                partitioner,
+                            )
+                            .await?;
+                        pause_writes = pause_writes || should_pause;
+                    }
+                    self.test_triggers.on_write().await;
                 }
 
                 Ok(pause_writes)
@@ -1869,6 +1884,129 @@ mod tests {
         let expected_progress = SequencerProgress::new()
             .with_buffered(SequenceNumber::new(1))
             .with_persisted(SequenceNumber::new(2));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+    }
+
+    #[tokio::test]
+    async fn partial_write_progress() {
+        test_helpers::maybe_start_logging();
+        let metrics = Arc::new(metric::Registry::new());
+        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+        let mut repos = catalog.repositories().await;
+        let kafka_topic = repos.kafka_topics().create_or_get("whatevs").await.unwrap();
+        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
+        let kafka_partition = KafkaPartition::new(0);
+        let namespace = repos
+            .namespaces()
+            .create("foo", "inf", kafka_topic.id, query_pool.id)
+            .await
+            .unwrap();
+        let sequencer1 = repos
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let sequencer2 = repos
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let mut sequencers = BTreeMap::new();
+        sequencers.insert(
+            sequencer1.id,
+            SequencerData::new(sequencer1.kafka_partition, Arc::clone(&metrics)),
+        );
+        sequencers.insert(
+            sequencer2.id,
+            SequencerData::new(sequencer2.kafka_partition, Arc::clone(&metrics)),
+        );
+
+        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+
+        let data = Arc::new(IngesterData::new(
+            Arc::clone(&object_store),
+            Arc::clone(&catalog),
+            sequencers,
+            Arc::new(DefaultPartitioner::default()),
+            Arc::new(Executor::new(1)),
+            BackoffConfig::default(),
+        ));
+
+        let schema = NamespaceSchema::new(namespace.id, kafka_topic.id, query_pool.id);
+
+        let ignored_ts = Time::from_timestamp_millis(42);
+
+        // write with sequence number 1
+        let w1 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 10", 0).unwrap(),
+            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+        );
+        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // write with sequence number 2
+        let w2 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 30\ncpu bar=1 20", 0).unwrap(),
+            DmlMeta::sequenced(Sequence::new(1, 2), ignored_ts, None, 50),
+        );
+        let _ = validate_or_insert_schema(w2.tables(), &schema, repos.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        drop(repos); // release catalog transaction
+
+        let manager = LifecycleManager::new(
+            LifecycleConfig::new(1, 0, 0, Duration::from_secs(1), Duration::from_secs(1)),
+            metrics,
+            Arc::new(SystemProvider::new()),
+        );
+
+        // buffer operation 1, expect progress buffered sequence number should be 1
+        data.buffer_operation(sequencer1.id, DmlOperation::Write(w1), &manager.handle())
+            .await
+            .unwrap();
+
+        // Get the namespace
+        let sd = data.sequencers.get(&sequencer1.id).unwrap();
+        let n = sd.namespace("foo").unwrap();
+
+        let expected_progress = SequencerProgress::new().with_buffered(SequenceNumber::new(1));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+
+        // configure the the namespace to wait after each insert.
+        n.test_triggers.enable_pause_after_write();
+
+        // now, buffer operation 2 which has two tables,
+        let captured_data = Arc::clone(&data);
+        let task = tokio::task::spawn(async move {
+            captured_data
+                .buffer_operation(sequencer1.id, DmlOperation::Write(w2), &manager.handle())
+                .await
+                .unwrap();
+        });
+
+        n.test_triggers.wait_for_pause_after_write().await;
+
+        // Check that while the write is only partially complete, the
+        // buffered sequence number hasn't increased
+        let expected_progress = SequencerProgress::new()
+            // sequence 2 hasn't been buffered yet
+            .with_buffered(SequenceNumber::new(1));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+
+        // allow the write to complete
+        n.test_triggers.release_pause_after_write().await;
+        task.await.expect("task completed unsuccessfully");
+
+        // check progresses after the write completes
+        let expected_progress = SequencerProgress::new()
+            .with_buffered(SequenceNumber::new(1))
+            .with_buffered(SequenceNumber::new(2));
         assert_progress(&data, kafka_partition, expected_progress).await;
     }
 
