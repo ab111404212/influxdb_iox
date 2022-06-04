@@ -46,6 +46,45 @@ impl SequencerProgress {
         self
     }
 
+    /// Note that the specified sequence number is still actively
+    /// buffering, and adjust `self.max_buffered` if necessary.
+    pub fn actively_buffering(mut self, sequence_number: Option<SequenceNumber>) -> Self {
+        let sequence_number = if let Some(val) = sequence_number {
+            val
+        } else {
+            return self;
+        };
+
+        let previous_sequence_number = if sequence_number.get() > 0 {
+            Some(SequenceNumber::new(sequence_number.get() - 1))
+        } else {
+            None
+        };
+
+        // If buffered is >= to sequence number, returns
+        // previous_sequence_number otherwise returns buffered
+        let clamp = |buffered: Option<SequenceNumber>| {
+            let buffered = if let Some(val) = buffered {
+                val
+            } else {
+                return previous_sequence_number;
+            };
+
+            if sequence_number <= buffered {
+                // back the sequence number down
+                previous_sequence_number
+            } else {
+                // no adjustment needed
+                Some(buffered)
+            }
+        };
+
+        self.max_buffered = clamp(self.max_buffered.take());
+        self.min_buffered = clamp(self.min_buffered.take());
+
+        self
+    }
+
     /// Note that data with `sequence_number` was persisted; Note this does not
     /// mean that all sequence numbers less than `sequence_number`
     /// have been persisted.
@@ -249,5 +288,94 @@ mod tests {
             .with_persisted(eq);
 
         assert_eq!(progress1.combine(progress2), expected);
+    }
+
+    #[test]
+    fn actively_buffering() {
+        let num0 = SequenceNumber::new(0);
+        let num1 = SequenceNumber::new(1);
+        let num2 = SequenceNumber::new(2);
+
+        #[derive(Debug)]
+        struct Expected {
+            min_buffered: Option<SequenceNumber>,
+            max_buffered: Option<SequenceNumber>,
+        }
+
+        let cases = vec![
+            // No buffering
+            (
+                SequencerProgress::new()
+                    .with_buffered(num1)
+                    .with_buffered(num2)
+                    .actively_buffering(None),
+                Expected {
+                    min_buffered: Some(num1),
+                    max_buffered: Some(num2),
+                },
+            ),
+            // actively buffering num2
+            (
+                SequencerProgress::new()
+                    .with_buffered(num1)
+                    .with_buffered(num2)
+                    .actively_buffering(Some(num2)),
+                Expected {
+                    min_buffered: Some(num1),
+                    max_buffered: Some(num1),
+                },
+            ),
+            // actively buffering only one
+            (
+                SequencerProgress::new()
+                    .with_buffered(num1)
+                    .actively_buffering(Some(num1)),
+                Expected {
+                    min_buffered: Some(num0),
+                    max_buffered: Some(num0),
+                },
+            ),
+            // actively buffering, haven't buffed any yet
+            (
+                SequencerProgress::new()
+                    .with_buffered(num0)
+                    .actively_buffering(Some(num1)),
+                Expected {
+                    min_buffered: Some(num0),
+                    max_buffered: Some(num0),
+                },
+            ),
+            // actively buffering, haven't buffered any
+            (
+                SequencerProgress::new().actively_buffering(Some(num0)),
+                Expected {
+                    min_buffered: None,
+                    max_buffered: None,
+                },
+            ),
+            // actively buffering partially buffered
+            (
+                SequencerProgress::new()
+                    .with_buffered(num0)
+                    .actively_buffering(Some(num0)),
+                Expected {
+                    min_buffered: None,
+                    max_buffered: None,
+                },
+            ),
+        ];
+
+        for (progress, expected) in cases {
+            println!("Comparing {:?} to {:?}", progress, expected);
+            assert_eq!(
+                progress.min_buffered, expected.min_buffered,
+                "min buffered mismatch"
+            );
+            assert_eq!(
+                progress.max_buffered, expected.max_buffered,
+                "max buffered mismatch"
+            );
+            assert_eq!(progress.max_persisted, None, "unexpected persisted");
+        }
     }
 }
