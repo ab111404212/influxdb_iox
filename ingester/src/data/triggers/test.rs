@@ -1,6 +1,5 @@
-use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Mutex};
 
 #[derive(Debug, Clone)]
 /// Synchronizes waiting on some test event
@@ -35,8 +34,8 @@ impl TestTriggers {
     }
 
     /// Note that the test should pause after the next write
-    pub(crate) fn enable_pause_after_write(&self) {
-        let mut write = self.write.lock();
+    pub(crate) async fn enable_pause_after_write(&self) {
+        let mut write = self.write.lock().await;
         assert!(write.is_none(), "previously configured pause");
         *write = Some(EventBarrier::new())
     }
@@ -44,6 +43,7 @@ impl TestTriggers {
     /// Waits until the write has been paused
     pub(crate) async fn wait_for_pause_after_write(&self) {
         self.write()
+            .await
             .expect("write barrier not configured")
             .before
             .wait()
@@ -52,16 +52,17 @@ impl TestTriggers {
 
     /// Note that a write has been done
     pub(crate) async fn on_write(&self) {
-        if let Some(write) = self.write() {
+        if let Some(write) = self.write().await {
             write.before.wait().await;
             write.after.wait().await;
         }
     }
 
     /// Release the waiting write and clear the pause
+
     pub(crate) async fn release_pause_after_write(&self) {
         // Hold lock the entire time so next write can't accidentally try and wait
-        let mut write = self.write.lock();
+        let mut write = self.write.lock().await;
         write
             .as_ref()
             .expect("write barrier not configured")
@@ -73,7 +74,7 @@ impl TestTriggers {
     }
 
     /// return the currently configured write event barrier
-    fn write(&self) -> Option<EventBarrier> {
-        self.write.lock().as_ref().cloned()
+    async fn write(&self) -> Option<EventBarrier> {
+        self.write.lock().await.as_ref().cloned()
     }
 }

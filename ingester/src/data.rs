@@ -1975,7 +1975,7 @@ mod tests {
         assert_progress(&data, kafka_partition, expected_progress).await;
 
         // configure the the namespace to wait after each insert.
-        n.test_triggers.enable_pause_after_write();
+        n.test_triggers.enable_pause_after_write().await;
 
         // now, buffer operation 2 which has two tables,
         let captured_data = Arc::clone(&data);
