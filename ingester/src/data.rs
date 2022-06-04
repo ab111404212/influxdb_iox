@@ -437,7 +437,6 @@ impl SequencerData {
         partitioner: &dyn Partitioner,
         executor: &Executor,
     ) -> Result<bool> {
-        debug!(?sequencer_id, "buffer operation");
         let namespace_data = match self.namespace(dml_operation.namespace()) {
             Some(d) => d,
             None => {
@@ -445,7 +444,6 @@ impl SequencerData {
                     .await?
             }
         };
-        debug!(?sequencer_id, "got namespace");
 
         namespace_data
             .buffer_operation(
@@ -575,8 +573,6 @@ impl NamespaceData {
             .sequence_number;
         let sequence_number = i64::try_from(sequence_number).expect("sequence out of bounds");
         let sequence_number = SequenceNumber::new(sequence_number);
-
-        debug!(?sequence_number, "buffering operation in namespace");
 
         // Note that this namespace is actively writing this sequence
         // number. Since there is no namespace wide lock held during a
