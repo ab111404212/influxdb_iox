@@ -2,7 +2,7 @@
 
 use crate::dml_handlers::{DmlError, DmlHandler, PartitionError, SchemaError};
 use bytes::{Bytes, BytesMut};
-use data_types::{org_and_bucket_to_database, OrgBucketMappingError};
+use data_types::{org_and_bucket_to_database,database_to_database, OrgBucketMappingError};
 use futures::StreamExt;
 use hashbrown::HashMap;
 use hyper::{header::CONTENT_ENCODING, Body, Method, Request, Response, StatusCode};
@@ -18,6 +18,8 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, TryAcquireError};
 use trace::ctx::SpanContext;
 use write_summary::WriteSummary;
+
+// use url::Url;
 
 const WRITE_TOKEN_HTTP_HEADER: &str = "X-IOx-Write-Token";
 
@@ -183,6 +185,7 @@ pub struct WriteInfo {
     precision: Precision,
 }
 
+
 impl<T> TryFrom<&Request<T>> for WriteInfo {
     type Error = OrgBucketError;
 
@@ -192,6 +195,32 @@ impl<T> TryFrom<&Request<T>> for WriteInfo {
 
         // An empty org or bucket is not acceptable.
         if got.org.is_empty() || got.bucket.is_empty() {
+            return Err(OrgBucketError::NotSpecified);
+        }
+
+        Ok(got)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+/// database identifiers for a DML operation.
+pub struct WriteDBInfo {
+    database: String,
+
+    #[serde(default)]
+    precision: Precision,
+}
+
+
+impl<T> TryFrom<&Request<T>> for WriteDBInfo {
+    type Error = OrgBucketError;
+
+    fn try_from(req: &Request<T>) -> Result<Self, Self::Error> {
+        let query = req.uri().query().ok_or(OrgBucketError::NotSpecified)?;
+        let got: WriteDBInfo = serde_urlencoded::from_str(query)?;
+
+        // An empty org or bucket is not acceptable.
+        if got.database.is_empty() {
             return Err(OrgBucketError::NotSpecified);
         }
 
@@ -321,6 +350,7 @@ where
         match (req.method(), req.uri().path()) {
             (&Method::POST, "/api/v2/write") => self.write_handler(req).await,
             (&Method::POST, "/api/v2/delete") => self.delete_handler(req).await,
+            (&Method::POST, "/api/v2/writedb") => self.write_db_handler(req).await,
             _ => return Err(Error::NoHandler),
         }
         .map(|summary| {
@@ -370,6 +400,56 @@ where
             %namespace,
             org=%write_info.org,
             bucket=%write_info.bucket,
+            "routing write",
+        );
+
+        let summary = self
+            .dml_handler
+            .write(&namespace, batches, span_ctx)
+            .await
+            .map_err(Into::into)?;
+
+        self.write_metric_lines.inc(stats.num_lines as _);
+        self.write_metric_fields.inc(stats.num_fields as _);
+        self.write_metric_tables.inc(num_tables as _);
+        self.write_metric_body_size.inc(body.len() as _);
+
+        Ok(summary)
+    }
+
+    async fn write_db_handler(&self, req: Request<Body>) -> Result<WriteSummary, Error> {
+        let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
+
+        let write_info = WriteDBInfo::try_from(&req)?;
+        let namespace = database_to_database(&write_info.database).map_err(OrgBucketError::MappingFail)?;
+
+        // Read the HTTP body and convert it to a str.
+        let body = self.read_body(req).await?;
+        let body = std::str::from_utf8(&body).map_err(Error::NonUtf8Body)?;
+
+        // The time, in nanoseconds since the epoch, to assign to any points that don't
+        // contain a timestamp
+        let default_time = self.time_provider.now().timestamp_nanos();
+
+        let mut converter = LinesConverter::new(default_time);
+        converter.set_timestamp_base(write_info.precision.timestamp_base());
+        let (batches, stats) = match converter.write_lp(body).and_then(|_| converter.finish()) {
+            Ok(v) => v,
+            Err(mutable_batch_lp::Error::EmptyPayload) => {
+                debug!("nothing to write");
+                return Ok(WriteSummary::default());
+            }
+            Err(e) => return Err(Error::ParseLineProtocol(e)),
+        };
+
+        let num_tables = batches.len();
+        debug!(
+            num_lines=stats.num_lines,
+            num_fields=stats.num_fields,
+            num_tables,
+            precision=?write_info.precision,
+            body_size=body.len(),
+            %namespace,
             "routing write",
         );
 

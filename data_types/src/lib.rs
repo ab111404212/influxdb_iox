@@ -1257,6 +1257,20 @@ pub fn org_and_bucket_to_database<'a, O: AsRef<str>, B: AsRef<str>>(
     DatabaseName::new(db_name).context(InvalidDatabaseNameSnafu)
 }
 
+/// direct pass a database as an IOx DatabaseName.
+pub fn database_to_database<'a, O: AsRef<str>>(
+    database: O,
+) -> Result<DatabaseName<'a>, OrgBucketMappingError> {
+    let database: Cow<'_, str> = utf8_percent_encode(database.as_ref(), NON_ALPHANUMERIC).into();
+
+    // An empty database is not acceptable.
+    if database.is_empty() {
+        return Err(OrgBucketMappingError::NotSpecified);
+    }
+    let db_name = format!("{}", database.as_ref());
+    DatabaseName::new(db_name).context(InvalidDatabaseNameSnafu)
+}
+
 /// A string that cannot be empty
 ///
 /// This is particularly useful for types that map to/from protobuf, where string fields

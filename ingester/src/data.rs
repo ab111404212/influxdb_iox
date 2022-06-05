@@ -797,6 +797,7 @@ impl TableData {
         lifecycle_handle: &dyn LifecycleHandle,
         partitioner: &dyn Partitioner,
     ) -> Result<bool> {
+
         let partition_key = partitioner
             .partition_key(&batch)
             .context(PartitioningSnafu)?;

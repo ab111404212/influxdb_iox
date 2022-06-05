@@ -258,7 +258,7 @@ fn new_gcs(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     panic!("GCS support not enabled, recompile with the gcp feature enabled")
 }
 
-#[cfg(feature = "aws")]
+// #[cfg(feature = "aws")]
 fn new_s3(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
     match (
         config.bucket.as_ref(),
@@ -296,10 +296,10 @@ fn new_s3(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError>
     }
 }
 
-#[cfg(not(feature = "aws"))]
-fn new_s3(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
-    panic!("S3 support not enabled, recompile with the aws feature enabled")
-}
+// #[cfg(not(feature = "aws"))]
+// fn new_s3(_: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
+//     panic!("S3 support not enabled, recompile with the aws feature enabled")
+// }
 
 #[cfg(feature = "azure")]
 fn new_azure(config: &ObjectStoreConfig) -> Result<Arc<DynObjectStore>, ParseError> {
