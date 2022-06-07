@@ -20,7 +20,7 @@ use ioxd_querier::{create_querier_server_type, QuerierServerTypeArgs};
 use ioxd_router::create_router_server_type;
 use object_store::DynObjectStore;
 use observability_deps::tracing::*;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use thiserror::Error;
 use trace_exporters::TracingConfig;
 use trogging::cli::LoggingConfig;
@@ -150,6 +150,10 @@ pub struct Config {
     #[clap(flatten)]
     pub(crate) tracing_config: TracingConfig,
 
+    /// object store options
+    #[clap(flatten)]
+    pub(crate) object_store_config: ObjectStoreConfig,
+    
     /// Maximum size of HTTP requests.
     #[clap(
         long = "--max-http-request-size",
@@ -160,8 +164,8 @@ pub struct Config {
 
     /// The location InfluxDB IOx will use to store files locally. If not specified, will run in
     /// ephemeral mode.
-    #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR")]
-    pub database_directory: Option<PathBuf>,
+    // #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR")]
+    // pub database_directory: Option<PathBuf>,
 
     /// Postgres connection string. If not specified, will use an in-memory catalog.
     #[clap(long = "--catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN")]
@@ -294,8 +298,8 @@ impl Config {
         let Self {
             logging_config,
             tracing_config,
+            object_store_config,
             max_http_request_size,
-            database_directory,
             dsn,
             postgres_schema_name,
             pause_ingest_size_bytes,
@@ -312,8 +316,9 @@ impl Config {
             querier_max_concurrent_queries,
         } = self;
 
-        let object_store_config = ObjectStoreConfig::new(database_directory.clone());
-        let write_buffer_config = WriteBufferConfig::new(QUERY_POOL_NAME, database_directory);
+        let database_directory = object_store_config.database_directory.clone();
+        // let object_store_config = ObjectStoreConfig::new(database_directory.clone());
+        let write_buffer_config = WriteBufferConfig::new(QUERY_POOL_NAME,database_directory);
         let catalog_dsn = dsn
             .map(|postgres_url| CatalogDsnConfig::new_postgres(postgres_url, postgres_schema_name))
             .unwrap_or_else(CatalogDsnConfig::new_memory);
