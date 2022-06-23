@@ -1,3 +1,4 @@
+pub mod common;
 pub mod influxrpc;
 pub mod reorg;
 pub mod sql;
@@ -69,7 +70,7 @@ mod test {
         let executor = Executor::new(1);
         let plan = executor
             .new_context(ExecutorType::Reorg)
-            .prepare_plan(&split_plan)
+            .create_physical_plan(&split_plan)
             .await
             .unwrap();
 

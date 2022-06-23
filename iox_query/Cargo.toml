@@ -14,7 +14,7 @@ description = "IOx Query Interface and Executor"
 # 2. Allow for query logic testing without bringing in all the storage systems.
 
 [dependencies] # In alphabetical order
-arrow = { version = "15.0.0", features = ["prettyprint"] }
+arrow = { version = "16.0.0", features = ["prettyprint"] }
 arrow_util = { path = "../arrow_util" }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false }
@@ -31,7 +31,7 @@ parking_lot = "0.12"
 query_functions = { path = "../query_functions"}
 schema = { path = "../schema" }
 snafu = "0.7"
-tokio = { version = "1.18", features = ["macros", "parking_lot"] }
+tokio = { version = "1.19", features = ["macros", "parking_lot"] }
 tokio-stream = "0.1"
 trace = { path = "../trace" }
 predicate = { path = "../predicate" }

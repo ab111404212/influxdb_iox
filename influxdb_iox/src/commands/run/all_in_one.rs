@@ -1,11 +1,14 @@
 //! Implementation of command line option for running all in one mode
 
 use super::main;
-use clap_blocks::object_store::make_object_store;
-use clap_blocks::querier::QuerierConfig;
 use clap_blocks::{
-    catalog_dsn::CatalogDsnConfig, compactor::CompactorConfig, ingester::IngesterConfig,
-    object_store::ObjectStoreConfig, run_config::RunConfig, socket_addr::SocketAddr,
+    catalog_dsn::CatalogDsnConfig,
+    compactor::CompactorConfig,
+    ingester::IngesterConfig,
+    object_store::{make_object_store, ObjectStoreConfig},
+    querier::QuerierConfig,
+    run_config::RunConfig,
+    socket_addr::SocketAddr,
     write_buffer::WriteBufferConfig,
 };
 use iox_query::exec::Executor;
@@ -65,6 +68,9 @@ pub enum Error {
 
     #[error("error initializing compactor: {0}")]
     Compactor(#[from] ioxd_compactor::Error),
+
+    #[error("Querier error: {0}")]
+    Querier(#[from] ioxd_querier::Error),
 
     #[error("Invalid config: {0}")]
     InvalidConfig(#[from] CommonServerStateError),
@@ -154,17 +160,18 @@ pub struct Config {
     #[clap(
         long = "--max-http-request-size",
         env = "INFLUXDB_IOX_MAX_HTTP_REQUEST_SIZE",
-        default_value = "10485760" // 10 MiB
+        default_value = "10485760", // 10 MiB
+        action,
     )]
     pub max_http_request_size: usize,
 
     /// The location InfluxDB IOx will use to store files locally. If not specified, will run in
     /// ephemeral mode.
-    #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR")]
+    #[clap(long = "--data-dir", env = "INFLUXDB_IOX_DB_DIR", action)]
     pub database_directory: Option<PathBuf>,
 
     /// Postgres connection string. If not specified, will use an in-memory catalog.
-    #[clap(long = "--catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN")]
+    #[clap(long = "--catalog-dsn", env = "INFLUXDB_IOX_CATALOG_DSN", action)]
     pub dsn: Option<String>,
 
     /// Schema name for PostgreSQL-based catalogs.
@@ -172,6 +179,7 @@ pub struct Config {
         long = "--catalog-postgres-schema-name",
         env = "INFLUXDB_IOX_CATALOG_POSTGRES_SCHEMA_NAME",
         default_value = iox_catalog::postgres::PostgresConnectionOptions::DEFAULT_SCHEMA_NAME,
+        action,
     )]
     pub postgres_schema_name: String,
 
@@ -182,7 +190,8 @@ pub struct Config {
     #[clap(
         long = "--pause-ingest-size-bytes",
         env = "INFLUXDB_IOX_PAUSE_INGEST_SIZE_BYTES",
-        default_value = "107374182400"
+        default_value = "107374182400",
+        action
     )]
     pub pause_ingest_size_bytes: usize,
 
@@ -194,7 +203,8 @@ pub struct Config {
     #[clap(
         long = "--persist-memory-threshold-bytes",
         env = "INFLUXDB_IOX_PERSIST_MEMORY_THRESHOLD_BYTES",
-        default_value = "1073741824"
+        default_value = "1073741824",
+        action
     )]
     pub persist_memory_threshold_bytes: usize,
 
@@ -203,7 +213,8 @@ pub struct Config {
     #[clap(
         long = "--persist-partition-size-threshold-bytes",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_SIZE_THRESHOLD_BYTES",
-        default_value = "314572800"
+        default_value = "314572800",
+        action
     )]
     pub persist_partition_size_threshold_bytes: usize,
 
@@ -214,7 +225,8 @@ pub struct Config {
     #[clap(
         long = "--persist-partition-age-threshold-seconds",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_AGE_THRESHOLD_SECONDS",
-        default_value = "1800"
+        default_value = "1800",
+        action
     )]
     pub persist_partition_age_threshold_seconds: u64,
 
@@ -223,51 +235,57 @@ pub struct Config {
     #[clap(
         long = "--persist-partition-cold-threshold-seconds",
         env = "INFLUXDB_IOX_PERSIST_PARTITION_COLD_THRESHOLD_SECONDS",
-        default_value = "300"
+        default_value = "300",
+        action
     )]
     pub persist_partition_cold_threshold_seconds: u64,
 
     /// The address on which IOx will serve Router HTTP API requests
     #[clap(
-    long = "--router-http-bind",
-    // by default, write API requests go to router
-    alias = "api-bind",
-    env = "INFLUXDB_IOX_ROUTER_HTTP_BIND_ADDR",
-    default_value = DEFAULT_ROUTER_HTTP_BIND_ADDR,
+        long = "--router-http-bind",
+        // by default, write API requests go to router
+        alias = "api-bind",
+        env = "INFLUXDB_IOX_ROUTER_HTTP_BIND_ADDR",
+        default_value = DEFAULT_ROUTER_HTTP_BIND_ADDR,
+        action,
     )]
     pub router_http_bind_address: SocketAddr,
 
     /// The address on which IOx will serve Router gRPC API requests
     #[clap(
-    long = "--router-grpc-bind",
-    env = "INFLUXDB_IOX_ROUTER_GRPC_BIND_ADDR",
-    default_value = DEFAULT_ROUTER_GRPC_BIND_ADDR,
+        long = "--router-grpc-bind",
+        env = "INFLUXDB_IOX_ROUTER_GRPC_BIND_ADDR",
+        default_value = DEFAULT_ROUTER_GRPC_BIND_ADDR,
+        action,
     )]
     pub router_grpc_bind_address: SocketAddr,
 
     /// The address on which IOx will serve Querier gRPC API requests
     #[clap(
-    long = "--querier-grpc-bind",
-    // by default, grpc requests go to querier
-    alias = "grpc-bind",
-    env = "INFLUXDB_IOX_QUERIER_GRPC_BIND_ADDR",
-    default_value = DEFAULT_QUERIER_GRPC_BIND_ADDR,
+        long = "--querier-grpc-bind",
+        // by default, grpc requests go to querier
+        alias = "grpc-bind",
+        env = "INFLUXDB_IOX_QUERIER_GRPC_BIND_ADDR",
+        default_value = DEFAULT_QUERIER_GRPC_BIND_ADDR,
+        action,
     )]
     pub querier_grpc_bind_address: SocketAddr,
 
     /// The address on which IOx will serve Router Ingester API requests
     #[clap(
-    long = "--ingester-grpc-bind",
-    env = "INFLUXDB_IOX_INGESTER_GRPC_BIND_ADDR",
-    default_value = DEFAULT_INGESTER_GRPC_BIND_ADDR,
+        long = "--ingester-grpc-bind",
+        env = "INFLUXDB_IOX_INGESTER_GRPC_BIND_ADDR",
+        default_value = DEFAULT_INGESTER_GRPC_BIND_ADDR,
+        action,
     )]
     pub ingester_grpc_bind_address: SocketAddr,
 
     /// The address on which IOx will serve Router Compactor API requests
     #[clap(
-    long = "--compactor-grpc-bind",
-    env = "INFLUXDB_IOX_COMPACTOR_GRPC_BIND_ADDR",
-    default_value = DEFAULT_COMPACTOR_GRPC_BIND_ADDR,
+        long = "--compactor-grpc-bind",
+        env = "INFLUXDB_IOX_COMPACTOR_GRPC_BIND_ADDR",
+        default_value = DEFAULT_COMPACTOR_GRPC_BIND_ADDR,
+        action,
     )]
     pub compactor_grpc_bind_address: SocketAddr,
 
@@ -275,7 +293,8 @@ pub struct Config {
     #[clap(
         long = "--querier-ram-pool-bytes",
         env = "INFLUXDB_IOX_QUERIER_RAM_POOL_BYTES",
-        default_value = "1073741824"
+        default_value = "1073741824",
+        action
     )]
     pub querier_ram_pool_bytes: usize,
 
@@ -283,7 +302,8 @@ pub struct Config {
     #[clap(
         long = "--querier-max-concurrent-queries",
         env = "INFLUXDB_IOX_QUERIER_MAX_CONCURRENT_QUERIES",
-        default_value = "10"
+        default_value = "10",
+        action
     )]
     pub querier_max_concurrent_queries: usize,
 }
@@ -501,13 +521,12 @@ pub async fn command(config: Config) -> Result<()> {
         metric_registry: Arc::clone(&metrics),
         catalog,
         object_store,
-        time_provider,
         exec,
+        time_provider,
         ingester_addresses,
-        ram_pool_bytes: querier_config.ram_pool_bytes(),
-        max_concurrent_queries: querier_config.max_concurrent_queries(),
+        querier_config,
     })
-    .await;
+    .await?;
 
     info!("starting all in one server");
 

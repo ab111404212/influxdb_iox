@@ -5,7 +5,7 @@ authors = ["Luke Bond <luke.n.bond@gmail.com>"]
 edition = "2021"
 
 [dependencies]
-arrow = { version = "15.0.0", features = ["prettyprint"] }
+arrow = { version = "16.0.0", features = ["prettyprint"] }
 async-trait = "0.1.56"
 backoff = { path = "../backoff" }
 bytes = "1.0"
@@ -23,13 +23,12 @@ schema = { path = "../schema" }
 snafu = "0.7"
 thiserror = "1.0"
 iox_time = { path = "../iox_time" }
-tokio = { version = "1.18", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.2" }
-uuid = { version = "0.8", features = ["v4"] }
+tokio = { version = "1.19", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.3" }
+uuid = { version = "1", features = ["v4"] }
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]
 arrow_util = { path = "../arrow_util" }
 iox_tests = { path = "../iox_tests" }
-querier = { path = "../querier"}
 test_helpers = { path = "../test_helpers" }

@@ -13,18 +13,27 @@ pub struct WriteBufferConfig {
     /// The type of write buffer to use.
     ///
     /// Valid options are: file, kafka
-    #[clap(long = "--write-buffer", env = "INFLUXDB_IOX_WRITE_BUFFER_TYPE")]
+    #[clap(
+        long = "--write-buffer",
+        env = "INFLUXDB_IOX_WRITE_BUFFER_TYPE",
+        action
+    )]
     pub(crate) type_: String,
 
     /// The address to the write buffer.
-    #[clap(long = "--write-buffer-addr", env = "INFLUXDB_IOX_WRITE_BUFFER_ADDR")]
+    #[clap(
+        long = "--write-buffer-addr",
+        env = "INFLUXDB_IOX_WRITE_BUFFER_ADDR",
+        action
+    )]
     pub(crate) connection_string: String,
 
     /// Write buffer topic/database that should be used.
     #[clap(
         long = "--write-buffer-topic",
         env = "INFLUXDB_IOX_WRITE_BUFFER_TOPIC",
-        default_value = "iox-shared"
+        default_value = "iox-shared",
+        action
     )]
     pub(crate) topic: String,
 
@@ -32,7 +41,8 @@ pub struct WriteBufferConfig {
     ///
     /// The concrete options depend on the write buffer type.
     ///
-    /// Command line arguments are passed as `--write-buffer-connection-config key1=value1 key2=value2` or
+    /// Command line arguments are passed as
+    /// `--write-buffer-connection-config key1=value1 key2=value2` or
     /// `--write-buffer-connection-config key1=value1,key2=value2`.
     ///
     /// Environment variables are passed as `key1=value1,key2=value2,...`.

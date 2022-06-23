@@ -1,20 +1,23 @@
 //! gRPC service implementations for `ingester`.
 
-use crate::{data::IngesterQueryResponse, handler::IngestHandler};
+use crate::{
+    data::{FlatIngesterQueryResponse, FlatIngesterQueryResponseStream},
+    handler::IngestHandler,
+};
 use arrow::error::ArrowError;
 use arrow_flight::{
     flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    HandshakeRequest, HandshakeResponse, IpcMessage, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
-use arrow_util::optimize::{optimize_record_batch, optimize_schema};
-use futures::{SinkExt, Stream, StreamExt};
+use flatbuffers::FlatBufferBuilder;
+use futures::Stream;
 use generated_types::influxdata::iox::ingester::v1::{
     self as proto,
     write_info_service_server::{WriteInfoService, WriteInfoServiceServer},
 };
 use observability_deps::tracing::{info, warn};
-use pin_project::{pin_project, pinned_drop};
+use pin_project::pin_project;
 use prost::Message;
 use snafu::{ResultExt, Snafu};
 use std::{
@@ -25,7 +28,6 @@ use std::{
     },
     task::Poll,
 };
-use tokio::task::JoinHandle;
 use tonic::{Request, Response, Streaming};
 use trace::ctx::SpanContext;
 use write_summary::WriteSummary;
@@ -118,9 +120,6 @@ impl WriteInfoService for WriteInfoServiceImpl {
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
 pub enum Error {
-    #[snafu(display("Failed to optimize record batch: {}", source))]
-    Optimize { source: ArrowError },
-
     #[snafu(display("Invalid ticket. Error: {:?} Ticket: {:?}", source, ticket))]
     InvalidTicket {
         source: prost::DecodeError,
@@ -176,7 +175,7 @@ impl From<Error> for tonic::Status {
                 // development
                 info!(?err, msg)
             }
-            Error::Optimize { .. } | Error::QueryStream { .. } | Error::Serialization { .. } => {
+            Error::QueryStream { .. } | Error::Serialization { .. } => {
                 warn!(?err, msg)
             }
         }
@@ -192,10 +191,9 @@ impl Error {
             Self::InvalidTicket { .. } | Self::InvalidQuery { .. } => {
                 Status::invalid_argument(self.to_string())
             }
-            Self::Query { .. }
-            | Self::Optimize { .. }
-            | Self::QueryStream { .. }
-            | Self::Serialization { .. } => Status::internal(self.to_string()),
+            Self::Query { .. } | Self::QueryStream { .. } | Self::Serialization { .. } => {
+                Status::internal(self.to_string())
+            }
             Self::NamespaceNotFound { .. } | Self::TableNotFound { .. } => {
                 Status::not_found(self.to_string())
             }
@@ -237,7 +235,7 @@ where
     }
 }
 
-type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + Sync + 'static>>;
+type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
@@ -292,7 +290,7 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
                     },
                 })?;
 
-        let output = GetStream::new(query_response).await?;
+        let output = GetStream::new(query_response.flatten());
 
         Ok(Response::new(Box::pin(output) as Self::DoGetStream))
     }
@@ -353,119 +351,21 @@ impl<I: IngestHandler + Send + Sync + 'static> Flight for FlightService<I> {
     }
 }
 
-#[pin_project(PinnedDrop)]
+#[pin_project]
 struct GetStream {
     #[pin]
-    rx: futures::channel::mpsc::Receiver<Result<FlightData, tonic::Status>>,
-    join_handle: JoinHandle<()>,
+    inner: Pin<Box<dyn Stream<Item = Result<FlatIngesterQueryResponse, ArrowError>> + Send>>,
     done: bool,
+    buffer: Vec<FlightData>,
 }
 
 impl GetStream {
-    async fn new(query_response: IngesterQueryResponse) -> Result<Self, tonic::Status> {
-        let IngesterQueryResponse {
-            mut data,
-            schema,
-            unpersisted_partitions,
-            batch_partition_ids,
-        } = query_response;
-
-        // setup channel
-        let (mut tx, rx) = futures::channel::mpsc::channel::<Result<FlightData, tonic::Status>>(1);
-
-        // get schema
-        let schema = Arc::new(optimize_schema(&schema.as_arrow()));
-        let options = arrow::ipc::writer::IpcWriteOptions::default();
-        let mut schema_flight_data: FlightData = SchemaAsIpc::new(&schema, &options).into();
-
-        // Add max_sequencer_number to app metadata
-        let mut bytes = bytes::BytesMut::new();
-        let app_metadata = proto::IngesterQueryResponseMetadata {
-            unpersisted_partitions: unpersisted_partitions
-                .into_iter()
-                .map(|(id, status)| {
-                    (
-                        id.get(),
-                        proto::PartitionStatus {
-                            parquet_max_sequence_number: status
-                                .parquet_max_sequence_number
-                                .map(|x| x.get()),
-                            tombstone_max_sequence_number: status
-                                .tombstone_max_sequence_number
-                                .map(|x| x.get()),
-                        },
-                    )
-                })
-                .collect(),
-            batch_partition_ids: batch_partition_ids.into_iter().map(|id| id.get()).collect(),
-        };
-        prost::Message::encode(&app_metadata, &mut bytes).context(SerializationSnafu)?;
-        schema_flight_data.app_metadata = bytes.to_vec();
-
-        let join_handle = tokio::spawn(async move {
-            if tx.send(Ok(schema_flight_data)).await.is_err() {
-                // receiver gone
-                return;
-            }
-
-            while let Some(batch_or_err) = data.next().await {
-                match batch_or_err {
-                    Ok(batch) => {
-                        match optimize_record_batch(&batch, Arc::clone(&schema)) {
-                            Ok(batch) => {
-                                let (flight_dictionaries, flight_batch) =
-                                    arrow_flight::utils::flight_data_from_arrow_batch(
-                                        &batch, &options,
-                                    );
-
-                                for dict in flight_dictionaries {
-                                    if tx.send(Ok(dict)).await.is_err() {
-                                        // receiver is gone
-                                        return;
-                                    }
-                                }
-
-                                if tx.send(Ok(flight_batch)).await.is_err() {
-                                    // receiver is gone
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                // failure sending here is OK because we're cutting the stream anyways
-                                tx.send(Err(Error::Optimize { source: e }.into()))
-                                    .await
-                                    .ok();
-
-                                // end stream
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // failure sending here is OK because we're cutting the stream anyways
-                        tx.send(Err(Error::QueryStream { source: e }.into()))
-                            .await
-                            .ok();
-
-                        // end stream
-                        return;
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            rx,
-            join_handle,
+    fn new(inner: FlatIngesterQueryResponseStream) -> Self {
+        Self {
+            inner,
             done: false,
-        })
-    }
-}
-
-#[pinned_drop]
-impl PinnedDrop for GetStream {
-    fn drop(self: Pin<&mut Self>) {
-        self.join_handle.abort();
+            buffer: vec![],
+        }
     }
 }
 
@@ -477,19 +377,242 @@ impl Stream for GetStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.project();
+
+        if !this.buffer.is_empty() {
+            let next = this.buffer.remove(0);
+            return Poll::Ready(Some(Ok(next)));
+        }
+
         if *this.done {
             Poll::Ready(None)
         } else {
-            match this.rx.poll_next(cx) {
+            match this.inner.poll_next(cx) {
+                Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => {
                     *this.done = true;
                     Poll::Ready(None)
                 }
-                e @ Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Err(e))) => {
                     *this.done = true;
-                    e
+                    let e = Error::QueryStream { source: e }.into();
+                    Poll::Ready(Some(Err(e)))
                 }
-                other => other,
+                Poll::Ready(Some(Ok(FlatIngesterQueryResponse::StartPartition {
+                    partition_id,
+                    status,
+                }))) => {
+                    let mut bytes = bytes::BytesMut::new();
+                    let app_metadata = proto::IngesterQueryResponseMetadata {
+                        partition_id: partition_id.get(),
+                        status: Some(proto::PartitionStatus {
+                            parquet_max_sequence_number: status
+                                .parquet_max_sequence_number
+                                .map(|x| x.get()),
+                            tombstone_max_sequence_number: status
+                                .tombstone_max_sequence_number
+                                .map(|x| x.get()),
+                        }),
+                    };
+                    prost::Message::encode(&app_metadata, &mut bytes)
+                        .context(SerializationSnafu)?;
+
+                    let flight_data = arrow_flight::FlightData::new(
+                        None,
+                        IpcMessage(build_none_flight_msg()),
+                        bytes.to_vec(),
+                        vec![],
+                    );
+                    Poll::Ready(Some(Ok(flight_data)))
+                }
+                Poll::Ready(Some(Ok(FlatIngesterQueryResponse::StartSnapshot { schema }))) => {
+                    let options = arrow::ipc::writer::IpcWriteOptions::default();
+                    let flight_data: FlightData = SchemaAsIpc::new(&schema, &options).into();
+                    Poll::Ready(Some(Ok(flight_data)))
+                }
+                Poll::Ready(Some(Ok(FlatIngesterQueryResponse::RecordBatch { batch }))) => {
+                    let options = arrow::ipc::writer::IpcWriteOptions::default();
+                    let (mut flight_dictionaries, flight_batch) =
+                        arrow_flight::utils::flight_data_from_arrow_batch(&batch, &options);
+                    std::mem::swap(this.buffer, &mut flight_dictionaries);
+                    this.buffer.push(flight_batch);
+                    let next = this.buffer.remove(0);
+                    Poll::Ready(Some(Ok(next)))
+                }
+            }
+        }
+    }
+}
+
+fn build_none_flight_msg() -> Vec<u8> {
+    let mut fbb = FlatBufferBuilder::new();
+
+    let mut message = arrow::ipc::MessageBuilder::new(&mut fbb);
+    message.add_version(arrow::ipc::MetadataVersion::V5);
+    message.add_header_type(arrow::ipc::MessageHeader::NONE);
+    message.add_bodyLength(0);
+
+    let data = message.finish();
+    fbb.finish(data, None);
+
+    fbb.finished_data().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::ipc::MessageHeader;
+    use data_types::PartitionId;
+    use futures::StreamExt;
+    use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
+    use schema::selection::Selection;
+
+    use crate::data::PartitionStatus;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_stream_empty() {
+        assert_get_stream(vec![], vec![]).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_all_types() {
+        let batch = lp_to_mutable_batch("table z=1 0")
+            .1
+            .to_arrow(Selection::All)
+            .unwrap();
+        let schema = batch.schema();
+
+        assert_get_stream(
+            vec![
+                Ok(FlatIngesterQueryResponse::StartPartition {
+                    partition_id: PartitionId::new(1),
+                    status: PartitionStatus {
+                        parquet_max_sequence_number: None,
+                        tombstone_max_sequence_number: None,
+                    },
+                }),
+                Ok(FlatIngesterQueryResponse::StartSnapshot { schema }),
+                Ok(FlatIngesterQueryResponse::RecordBatch { batch }),
+            ],
+            vec![
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::NONE,
+                    app_metadata: proto::IngesterQueryResponseMetadata {
+                        partition_id: 1,
+                        status: Some(proto::PartitionStatus {
+                            parquet_max_sequence_number: None,
+                            tombstone_max_sequence_number: None,
+                        }),
+                    },
+                }),
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::Schema,
+                    app_metadata: proto::IngesterQueryResponseMetadata::default(),
+                }),
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::RecordBatch,
+                    app_metadata: proto::IngesterQueryResponseMetadata::default(),
+                }),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_shortcuts_err() {
+        assert_get_stream(
+            vec![
+                Ok(FlatIngesterQueryResponse::StartPartition {
+                    partition_id: PartitionId::new(1),
+                    status: PartitionStatus {
+                        parquet_max_sequence_number: None,
+                        tombstone_max_sequence_number: None,
+                    },
+                }),
+                Err(ArrowError::IoError("foo".into())),
+                Ok(FlatIngesterQueryResponse::StartPartition {
+                    partition_id: PartitionId::new(1),
+                    status: PartitionStatus {
+                        parquet_max_sequence_number: None,
+                        tombstone_max_sequence_number: None,
+                    },
+                }),
+            ],
+            vec![
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::NONE,
+                    app_metadata: proto::IngesterQueryResponseMetadata {
+                        partition_id: 1,
+                        status: Some(proto::PartitionStatus {
+                            parquet_max_sequence_number: None,
+                            tombstone_max_sequence_number: None,
+                        }),
+                    },
+                }),
+                Err(tonic::Code::Internal),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_dictionary_batches() {
+        let batch = lp_to_mutable_batch("table,x=\"foo\",y=\"bar\" z=1 0")
+            .1
+            .to_arrow(Selection::All)
+            .unwrap();
+
+        assert_get_stream(
+            vec![Ok(FlatIngesterQueryResponse::RecordBatch { batch })],
+            vec![
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::DictionaryBatch,
+                    app_metadata: proto::IngesterQueryResponseMetadata::default(),
+                }),
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::DictionaryBatch,
+                    app_metadata: proto::IngesterQueryResponseMetadata::default(),
+                }),
+                Ok(DecodedFlightData {
+                    header_type: MessageHeader::RecordBatch,
+                    app_metadata: proto::IngesterQueryResponseMetadata::default(),
+                }),
+            ],
+        )
+        .await;
+    }
+
+    struct DecodedFlightData {
+        header_type: MessageHeader,
+        app_metadata: proto::IngesterQueryResponseMetadata,
+    }
+
+    async fn assert_get_stream(
+        inputs: Vec<Result<FlatIngesterQueryResponse, ArrowError>>,
+        expected: Vec<Result<DecodedFlightData, tonic::Code>>,
+    ) {
+        let inner = Box::pin(futures::stream::iter(inputs));
+        let stream = GetStream::new(inner);
+        let actual: Vec<_> = stream.collect().await;
+        assert_eq!(actual.len(), expected.len());
+
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    let header_type = arrow::ipc::root_as_message(&actual.data_header[..])
+                        .unwrap()
+                        .header_type();
+                    assert_eq!(header_type, expected.header_type);
+
+                    let app_metadata: proto::IngesterQueryResponseMetadata =
+                        prost::Message::decode(&actual.app_metadata[..]).unwrap();
+                    assert_eq!(app_metadata, expected.app_metadata);
+                }
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.code(), expected);
+                }
+                (Ok(_), Err(_)) => panic!("Actual is Ok but expected is Err"),
+                (Err(_), Ok(_)) => panic!("Actual is Err but expected is Ok"),
             }
         }
     }

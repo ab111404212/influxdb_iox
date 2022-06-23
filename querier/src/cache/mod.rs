@@ -47,6 +47,12 @@ pub struct CatalogCache {
     /// tombstone cache
     tombstone_cache: TombstoneCache,
 
+    /// Read buffer chunk cache
+    read_buffer_cache: ReadBufferCache,
+
+    /// Metric registry
+    metric_registry: Arc<metric::Registry>,
+
     /// Time provider.
     time_provider: Arc<dyn TimeProvider>,
 }
@@ -104,9 +110,15 @@ impl CatalogCache {
         );
         let tombstone_cache = TombstoneCache::new(
             Arc::clone(&catalog),
-            backoff_config,
+            backoff_config.clone(),
             Arc::clone(&time_provider),
             &metric_registry,
+            Arc::clone(&ram_pool),
+        );
+        let read_buffer_cache = ReadBufferCache::new(
+            backoff_config,
+            Arc::clone(&time_provider),
+            Arc::clone(&metric_registry),
             Arc::clone(&ram_pool),
         );
 
@@ -118,6 +130,8 @@ impl CatalogCache {
             processed_tombstones_cache,
             parquet_file_cache,
             tombstone_cache,
+            read_buffer_cache,
+            metric_registry,
             time_provider,
         }
     }
@@ -125,6 +139,11 @@ impl CatalogCache {
     /// Get underlying catalog
     pub(crate) fn catalog(&self) -> Arc<dyn Catalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Get underlying metric registry.
+    pub(crate) fn metric_registry(&self) -> Arc<metric::Registry> {
+        Arc::clone(&self.metric_registry)
     }
 
     /// Get underlying time provider
@@ -164,6 +183,6 @@ impl CatalogCache {
 
     /// Read buffer chunk cache.
     pub(crate) fn read_buffer(&self) -> &ReadBufferCache {
-        unimplemented!("Deliberately not hooking up this cache yet");
+        &self.read_buffer_cache
     }
 }

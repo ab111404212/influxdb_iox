@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use data_types::Sequence;
+use data_types::{Sequence, SequenceNumber};
 use dml::{DmlMeta, DmlOperation};
 use futures::{stream::BoxStream, StreamExt};
 use iox_time::{Time, TimeProvider};
@@ -188,10 +188,7 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
 
             let sequence = Sequence {
                 sequencer_id,
-                sequence_number: record
-                    .offset
-                    .try_into()
-                    .map_err(WriteBufferError::invalid_data)?,
+                sequence_number: SequenceNumber::new(record.offset),
             };
 
             let timestamp_millis =
@@ -216,8 +213,8 @@ impl WriteBufferStreamHandler for RSKafkaStreamHandler {
         stream.boxed()
     }
 
-    async fn seek(&mut self, sequence_number: u64) -> Result<(), WriteBufferError> {
-        let offset = i64::try_from(sequence_number).map_err(WriteBufferError::invalid_input)?;
+    async fn seek(&mut self, sequence_number: SequenceNumber) -> Result<(), WriteBufferError> {
+        let offset = sequence_number.get();
         *self.next_offset.lock() = Some(offset);
         self.terminated.store(false, Ordering::SeqCst);
         Ok(())
@@ -292,7 +289,10 @@ impl WriteBufferReading for RSKafkaConsumer {
         }))
     }
 
-    async fn fetch_high_watermark(&self, sequencer_id: u32) -> Result<u64, WriteBufferError> {
+    async fn fetch_high_watermark(
+        &self,
+        sequencer_id: u32,
+    ) -> Result<SequenceNumber, WriteBufferError> {
         let partition_client = self
             .partition_clients
             .get(&sequencer_id)
@@ -301,7 +301,7 @@ impl WriteBufferReading for RSKafkaConsumer {
             })?;
 
         let watermark = partition_client.get_offset(OffsetAt::Latest).await?;
-        u64::try_from(watermark).map_err(WriteBufferError::invalid_data)
+        Ok(SequenceNumber::new(watermark))
     }
 
     fn type_name(&self) -> &'static str {
@@ -377,7 +377,7 @@ mod tests {
         },
         maybe_skip_kafka_integration,
     };
-    use data_types::{DeletePredicate, TimestampRange};
+    use data_types::{DeletePredicate, PartitionKey, TimestampRange};
     use dml::{test_util::assert_write_op_eq, DmlDelete, DmlWrite};
     use futures::{stream::FuturesUnordered, TryStreamExt};
     use rskafka::{client::partition::Compression, record::Record};
@@ -534,6 +534,7 @@ mod tests {
             &producer,
             "table foo=1 1",
             sequencer_id,
+            "bananas".into(),
             None,
         )
         .await;
@@ -566,19 +567,19 @@ mod tests {
 
         let (w1_1, w1_2, w2_1, d1_1, d1_2, w1_3, w1_4, w2_2) = tokio::join!(
             // ns1: batch 1
-            write("ns1", &producer, &trace_collector, sequencer_id),
-            write("ns1", &producer, &trace_collector, sequencer_id),
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
             // ns2: batch 1, part A
-            write("ns2", &producer, &trace_collector, sequencer_id),
+            write("ns2", &producer, &trace_collector, sequencer_id, "bananas"),
             // ns1: batch 2
             delete("ns1", &producer, &trace_collector, sequencer_id),
             // ns1: batch 3
             delete("ns1", &producer, &trace_collector, sequencer_id),
             // ns1: batch 4
-            write("ns1", &producer, &trace_collector, sequencer_id),
-            write("ns1", &producer, &trace_collector, sequencer_id),
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
             // ns2: batch 1, part B
-            write("ns2", &producer, &trace_collector, sequencer_id),
+            write("ns2", &producer, &trace_collector, sequencer_id, "bananas"),
         );
 
         // ensure that write operations were fused
@@ -674,15 +675,71 @@ mod tests {
         );
     }
 
+    // Coverage of https://github.com/influxdata/influxdb_iox/issues/4787
+    #[tokio::test]
+    async fn test_batching_respects_partitioning() {
+        let conn = maybe_skip_kafka_integration!();
+        let adapter = RSKafkaTestAdapter::new(conn);
+        let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
+        let trace_collector = ctx.trace_collector();
+
+        let producer = ctx.writing(true).await.unwrap();
+
+        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
+
+        let (w1, w2, w3) = tokio::join!(
+            // These two ops have the same partition key, and therefore can be
+            // merged together.
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            write("ns1", &producer, &trace_collector, sequencer_id, "bananas"),
+            // However this op has a different partition_key and cannot be
+            // merged with the others.
+            write("ns1", &producer, &trace_collector, sequencer_id, "platanos"),
+        );
+
+        // Assert ops 1 and 2 were merged, by asserting they have the same
+        // sequence number.
+        assert_eq!(w1.sequence().unwrap(), w2.sequence().unwrap());
+
+        // And assert the third op was not merged because of the differing
+        // partition key.
+        assert_ne!(w1.sequence().unwrap(), w3.sequence().unwrap());
+    }
+
+    #[tokio::test]
+    #[should_panic = "enqueuing unpartitioned write into kafka"]
+    async fn test_enqueue_no_partition_key() {
+        let conn = maybe_skip_kafka_integration!("enqueuing unpartitioned write into kafka");
+        let adapter = RSKafkaTestAdapter::new(conn);
+        let ctx = adapter.new_context(NonZeroU32::new(1).unwrap()).await;
+
+        let producer = ctx.writing(true).await.unwrap();
+
+        let tables = mutable_batch_lp::lines_to_batches("table foo=1", 0).unwrap();
+        let write = DmlWrite::new("bananas", tables, None, DmlMeta::unsequenced(None));
+
+        let sequencer_id = set_pop_first(&mut producer.sequencer_ids()).unwrap();
+        producer
+            .store_operation(sequencer_id, &DmlOperation::Write(write))
+            .await
+            .unwrap();
+    }
+
     async fn write(
         namespace: &str,
         producer: &RSKafkaProducer,
         trace_collector: &Arc<RingBufferTraceCollector>,
         sequencer_id: u32,
+        partition_key: impl Into<PartitionKey> + Send,
     ) -> DmlMeta {
         let span_ctx = SpanContext::new(Arc::clone(trace_collector) as Arc<_>);
         let tables = mutable_batch_lp::lines_to_batches("table foo=1", 0).unwrap();
-        let write = DmlWrite::new(namespace, tables, DmlMeta::unsequenced(Some(span_ctx)));
+        let write = DmlWrite::new(
+            namespace,
+            tables,
+            Some(partition_key.into()),
+            DmlMeta::unsequenced(Some(span_ctx)),
+        );
         let op = DmlOperation::Write(write);
         producer.store_operation(sequencer_id, &op).await.unwrap()
     }

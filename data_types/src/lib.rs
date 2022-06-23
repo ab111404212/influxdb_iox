@@ -22,9 +22,9 @@ use std::{
     borrow::{Borrow, Cow},
     collections::BTreeMap,
     convert::TryFrom,
-    fmt::Write,
+    fmt::{Display, Write},
     mem::{self, size_of_val},
-    num::{FpCategory, NonZeroU32, NonZeroU64},
+    num::{FpCategory, NonZeroU64},
     ops::{Add, Deref, RangeInclusive, Sub},
     sync::Arc,
 };
@@ -265,7 +265,7 @@ impl Sub<i64> for SequenceNumber {
     }
 }
 
-/// A time in nanoseconds from epoch
+/// A time in nanoseconds from epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct Timestamp(i64);
@@ -280,19 +280,35 @@ impl Timestamp {
     }
 }
 
+impl Add for Timestamp {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0.checked_add(other.0).expect("timestamp wraparound"))
+    }
+}
+
+impl Sub for Timestamp {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self(self.0.checked_sub(other.0).expect("timestamp wraparound"))
+    }
+}
+
 impl Add<i64> for Timestamp {
     type Output = Self;
 
-    fn add(self, other: i64) -> Self {
-        Self(self.0 + other)
+    fn add(self, rhs: i64) -> Self::Output {
+        self + Self(rhs)
     }
 }
 
 impl Sub<i64> for Timestamp {
     type Output = Self;
 
-    fn sub(self, other: i64) -> Self {
-        Self(self.0 - other)
+    fn sub(self, rhs: i64) -> Self::Output {
+        self - Self(rhs)
     }
 }
 
@@ -657,7 +673,64 @@ pub struct Sequencer {
     /// can be persisted at different times, it is possible some data has been persisted
     /// with a higher sequence number than this. However, all data with a sequence number
     /// lower than this must have been persisted to Parquet.
-    pub min_unpersisted_sequence_number: i64,
+    pub min_unpersisted_sequence_number: SequenceNumber,
+}
+
+/// Defines an partition via an arbitrary string within a table within
+/// a namespace.
+///
+/// Implemented as a reference-counted string, serialisable to
+/// the Postgres VARCHAR data type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PartitionKey(Arc<str>);
+
+impl Display for PartitionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for PartitionKey {
+    fn from(s: String) -> Self {
+        assert!(!s.is_empty());
+        Self(s.into())
+    }
+}
+
+impl From<&str> for PartitionKey {
+    fn from(s: &str) -> Self {
+        assert!(!s.is_empty());
+        Self(s.into())
+    }
+}
+
+impl<DB> sqlx::Type<DB> for PartitionKey
+where
+    DB: sqlx::Database<TypeInfo = sqlx::postgres::PgTypeInfo>,
+{
+    fn type_info() -> DB::TypeInfo {
+        // Store this type as VARCHAR
+        sqlx::postgres::PgTypeInfo::with_name("VARCHAR")
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for PartitionKey {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Postgres as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        <&str as sqlx::Encode<sqlx::Postgres>>::encode(&self.0, buf)
+    }
+}
+
+impl sqlx::Decode<'_, sqlx::Postgres> for PartitionKey {
+    fn decode(
+        value: <sqlx::Postgres as sqlx::database::HasValueRef<'_>>::ValueRef,
+    ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+        Ok(Self(
+            <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?.into(),
+        ))
+    }
 }
 
 /// Data object for a partition. The combination of sequencer, table and key are unique (i.e. only
@@ -671,18 +744,27 @@ pub struct Partition {
     /// the table the partition is under
     pub table_id: TableId,
     /// the string key of the partition
-    pub partition_key: String,
-    /// The sort key for the partition. Should be computed on the first persist operation for
-    /// this partition and updated if new tag columns are added.
-    pub sort_key: Option<String>,
+    pub partition_key: PartitionKey,
+    /// Sort key is a vector of names of all tags and time of the data that belongs to this partition.
+    /// Since we allow data in each chunk (aka data in a parquet file) contains different set of columns,
+    /// different partitions may contain different set of sort_key but they must be subsets of PK of the table.
+    ///
+    /// When the partition is first created before its data is saved in the parquet_file table,
+    /// this sort_key is empty and means it is not yet set or unknown.
+    /// The sort_key is computed and updated as needed on persist operations for this partition. The update
+    /// happens when the data of this partition is first persisted (must at least include `time` column if no tags)
+    /// and, later on, when data with new tags are ingested into this partition
+    pub sort_key: Vec<String>,
 }
 
 impl Partition {
     /// The sort key for the partition, if present, structured as a `SortKey`
     pub fn sort_key(&self) -> Option<SortKey> {
-        self.sort_key
-            .as_ref()
-            .map(|s| SortKey::from_columns(s.split(',')))
+        if self.sort_key.is_empty() {
+            return None;
+        }
+
+        Some(SortKey::from_columns(self.sort_key.iter().map(|s| &**s)))
     }
 }
 
@@ -722,8 +804,67 @@ impl Tombstone {
     }
 }
 
+/// Set of columns.
+#[derive(Debug, Clone, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ColumnSet(Vec<String>);
+
+impl ColumnSet {
+    /// Create new column set.
+    ///
+    /// The order of the passed columns will NOT be preserved.
+    ///
+    /// # Panic
+    /// Panics when the set of passed columns contains duplicates.
+    pub fn new<T, I>(columns: I) -> Self
+    where
+        T: Into<String>,
+        I: IntoIterator<Item = T>,
+    {
+        let mut columns: Vec<String> = columns
+            .into_iter()
+            .map(|c| {
+                let mut col: String = c.into();
+                col.shrink_to_fit();
+                col
+            })
+            .collect();
+        columns.sort();
+
+        let len_pre_dedup = columns.len();
+        columns.dedup();
+        let len_post_dedup = columns.len();
+        assert_eq!(len_pre_dedup, len_post_dedup, "set contains duplicates");
+
+        columns.shrink_to_fit();
+
+        Self(columns)
+    }
+
+    /// Estimate the memory consumption of this object and its contents
+    pub fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + (std::mem::size_of::<String>() * self.0.capacity())
+            + self.0.iter().map(|s| s.len()).sum::<usize>()
+    }
+}
+
+impl From<ColumnSet> for Vec<String> {
+    fn from(set: ColumnSet) -> Self {
+        set.0
+    }
+}
+
+impl Deref for ColumnSet {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
 /// Data for a parquet file reference that has been inserted in the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct ParquetFile {
     /// the id of the file in the catalog
     pub id: ParquetFileId,
@@ -755,13 +896,28 @@ pub struct ParquetFile {
     pub compaction_level: i16,
     /// the creation time of the parquet file
     pub created_at: Timestamp,
+    /// Set of columns within this parquet file.
+    ///
+    /// # Relation to Table-wide Column Set
+    /// Columns within this set may or may not be part of the table-wide schema.
+    ///
+    /// Columns that are NOT part of the table-wide schema must be ignored. It is likely that these
+    /// columns were originally part of the table but were later removed.
+    ///
+    /// # Column Types
+    /// Column types are identical to the table-wide types.
+    ///
+    /// # Column Order & Sort Key
+    /// The columns that are present in the table-wide schema are sorted according to the partition
+    /// sort key. The occur in the parquet file according to this order.
+    pub column_set: ColumnSet,
 }
 
 impl ParquetFile {
     /// Estimate the memory consumption of this object and its contents
     pub fn size(&self) -> usize {
-        // No additional heap allocations
-        std::mem::size_of_val(self)
+        std::mem::size_of_val(self) + self.column_set.size()
+            - std::mem::size_of_val(&self.column_set)
     }
 }
 
@@ -801,6 +957,10 @@ pub struct ParquetFileWithMetadata {
     pub compaction_level: i16,
     /// the creation time of the parquet file
     pub created_at: Timestamp,
+    /// Set of columns within this parquet file.
+    ///
+    /// See [`ParquetFile::column_set`].
+    pub column_set: ColumnSet,
 }
 
 impl ParquetFileWithMetadata {
@@ -823,6 +983,7 @@ impl ParquetFileWithMetadata {
             row_count,
             compaction_level,
             created_at,
+            column_set: columns,
         } = parquet_file;
 
         Self {
@@ -842,6 +1003,7 @@ impl ParquetFileWithMetadata {
             row_count,
             compaction_level,
             created_at,
+            column_set: columns,
         }
     }
 
@@ -865,6 +1027,7 @@ impl ParquetFileWithMetadata {
             row_count,
             compaction_level,
             created_at,
+            column_set: columns,
         } = self;
 
         (
@@ -884,6 +1047,7 @@ impl ParquetFileWithMetadata {
                 row_count,
                 compaction_level,
                 created_at,
+                column_set: columns,
             },
             parquet_metadata,
         )
@@ -921,6 +1085,8 @@ pub struct ParquetFileParams {
     pub compaction_level: i16,
     /// the creation time of the parquet file
     pub created_at: Timestamp,
+    /// columns in this file.
+    pub column_set: ColumnSet,
 }
 
 /// Data for a processed tombstone reference in the catalog.
@@ -973,7 +1139,7 @@ impl std::fmt::Debug for ChunkId {
 
 impl std::fmt::Display for ChunkId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if (self.0.get_variant() == Some(uuid::Variant::RFC4122))
+        if (self.0.get_variant() == uuid::Variant::RFC4122)
             && (self.0.get_version() == Some(uuid::Version::Random))
         {
             f.debug_tuple("ChunkId").field(&self.0).finish()
@@ -995,16 +1161,15 @@ impl From<Uuid> for ChunkId {
 /// 1. **upsert order:** chunks with higher order overwrite data in chunks with lower order
 /// 2. **locking order:** chunks must be locked in consistent (ascending) order
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChunkOrder(NonZeroU32);
+pub struct ChunkOrder(i64);
 
 impl ChunkOrder {
     /// The minimum ordering value a chunk could have. Currently only used in testing.
-    // TODO: remove `unsafe` once https://github.com/rust-lang/rust/issues/51999 is fixed
-    pub const MIN: Self = Self(unsafe { NonZeroU32::new_unchecked(1) });
+    pub const MIN: Self = Self(0);
 
     /// Create a ChunkOrder from the given value.
-    pub fn new(order: u32) -> Option<Self> {
-        NonZeroU32::new(order).map(Self)
+    pub fn new(order: i64) -> Option<Self> {
+        Some(Self(order))
     }
 }
 
@@ -1950,12 +2115,12 @@ pub struct Sequence {
     /// The sequencer id (kafka partition id)
     pub sequencer_id: u32,
     /// The sequence number (kafka offset)
-    pub sequence_number: u64,
+    pub sequence_number: SequenceNumber,
 }
 
 impl Sequence {
     /// Create a new Sequence
-    pub fn new(sequencer_id: u32, sequence_number: u64) -> Self {
+    pub fn new(sequencer_id: u32, sequence_number: SequenceNumber) -> Self {
         Self {
             sequencer_id,
             sequence_number,
@@ -3130,5 +3295,35 @@ mod tests {
             tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
         };
         assert!(schema1.size() < schema2.size());
+    }
+
+    #[test]
+    #[should_panic = "timestamp wraparound"]
+    fn test_timestamp_wraparound_panic_add_i64() {
+        let _ = Timestamp::new(i64::MAX) + 1;
+    }
+
+    #[test]
+    #[should_panic = "timestamp wraparound"]
+    fn test_timestamp_wraparound_panic_sub_i64() {
+        let _ = Timestamp::new(i64::MIN) - 1;
+    }
+
+    #[test]
+    #[should_panic = "timestamp wraparound"]
+    fn test_timestamp_wraparound_panic_add_timestamp() {
+        let _ = Timestamp::new(i64::MAX) + Timestamp::new(1);
+    }
+
+    #[test]
+    #[should_panic = "timestamp wraparound"]
+    fn test_timestamp_wraparound_panic_sub_timestamp() {
+        let _ = Timestamp::new(i64::MIN) - Timestamp::new(1);
+    }
+
+    #[test]
+    #[should_panic = "set contains duplicates"]
+    fn test_column_set_duplicates() {
+        ColumnSet::new(["foo", "bar", "foo"]);
     }
 }

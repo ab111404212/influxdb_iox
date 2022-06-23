@@ -237,11 +237,10 @@ mod tests {
 
     #[test]
     fn query_round_trip() {
-        let rust_predicate = predicate::PredicateBuilder::new()
-            .timestamp_range(1, 100)
-            .add_expr(col("foo"))
-            .add_value_expr(col("_value").eq(lit("bar")).try_into().unwrap())
-            .build();
+        let rust_predicate = predicate::Predicate::new()
+            .with_range(1, 100)
+            .with_expr(col("foo"))
+            .with_value_expr(col("_value").eq(lit("bar")).try_into().unwrap());
 
         let rust_query = IngesterQueryRequest::new(
             "mydb".into(),

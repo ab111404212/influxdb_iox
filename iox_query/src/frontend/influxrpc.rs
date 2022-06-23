@@ -2,23 +2,19 @@
 
 use crate::{
     exec::{field::FieldColumns, make_non_null_checker, make_schema_pivot, IOxSessionContext},
+    frontend::common::ScanPlanBuilder,
     plan::{
         fieldlist::FieldListPlan,
         seriesset::{SeriesSetPlan, SeriesSetPlans},
         stringset::{Error as StringSetError, StringSetPlan, StringSetPlanBuilder},
     },
-    provider::ProviderBuilder,
-    util::MissingColumnsToNull,
     QueryChunk, QueryDatabase,
 };
 use arrow::datatypes::DataType;
 use data_types::ChunkId;
 use datafusion::{
     error::DataFusionError,
-    logical_plan::{
-        col, provider_as_source, when, DFSchemaRef, Expr, ExprRewritable, ExprSchemable,
-        LogicalPlan, LogicalPlanBuilder,
-    },
+    logical_plan::{col, when, DFSchemaRef, Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder},
 };
 use datafusion_util::AsExpr;
 use hashbrown::HashSet;
@@ -66,9 +62,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unsupported predicate in gRPC table_names: {:?}", predicate))]
-    UnsupportedPredicateForTableNames { predicate: Predicate },
-
     #[snafu(display(
         "gRPC planner got error fetching chunks for table '{}': {}",
         table_name,
@@ -92,16 +85,6 @@ pub enum Error {
     #[snafu(display("gRPC planner got error creating string set plan: {}", source))]
     CreatingStringSet { source: StringSetError },
 
-    #[snafu(display(
-        "gRPC planner got error adding chunk for table {}: {}",
-        table_name,
-        source
-    ))]
-    CreatingProvider {
-        table_name: String,
-        source: crate::provider::Error,
-    },
-
     #[snafu(display("gRPC planner got error creating predicates: {}", source))]
     CreatingPredicates {
         source: datafusion::error::DataFusionError,
@@ -111,9 +94,6 @@ pub enum Error {
     BuildingPlan {
         source: datafusion::error::DataFusionError,
     },
-
-    #[snafu(display("gRPC planner error: unsupported predicate: {}", source))]
-    UnsupportedPredicate { source: DataFusionError },
 
     #[snafu(display(
         "gRPC planner error: column '{}' is not a tag, it is {:?}",
@@ -153,6 +133,9 @@ pub enum Error {
         source: query_functions::group_by::Error,
     },
 
+    #[snafu(display("Error creating scan:  {}", source))]
+    CreatingScan { source: super::common::Error },
+
     #[snafu(display(
         "gRPC planner got error casting aggregate {:?} for {}: {}",
         agg,
@@ -173,19 +156,21 @@ pub enum Error {
 
     #[snafu(display("Table was removed while planning query: {}", table_name))]
     TableRemoved { table_name: String },
-
-    #[snafu(display(
-        "Internal gRPC planner rewriting predicate for {}: {}",
-        table_name,
-        source
-    ))]
-    RewritingFilterPredicate {
-        table_name: String,
-        source: datafusion::error::DataFusionError,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl From<super::common::Error> for Error {
+    fn from(source: super::common::Error) -> Self {
+        Self::CreatingScan { source }
+    }
+}
+
+impl From<DataFusionError> for Error {
+    fn from(source: DataFusionError) -> Self {
+        Self::BuildingPlan { source }
+    }
+}
 
 /// Plans queries that originate from the InfluxDB Storage gRPC
 /// interface, which are in terms of the InfluxDB Data model (e.g.
@@ -320,9 +305,8 @@ impl InfluxRpcPlanner {
                     .table_schema(table_name)
                     .context(TableRemovedSnafu { table_name })?;
 
-                if let Some(plan) = self.table_name_plan(table_name, schema, predicate, chunks)? {
-                    builder = builder.append_other(plan.into());
-                }
+                let plan = self.table_name_plan(table_name, schema, predicate, chunks)?;
+                builder = builder.append_other(plan.into());
             }
         }
 
@@ -608,42 +592,34 @@ impl InfluxRpcPlanner {
                     .table_schema(table_name)
                     .context(TableRemovedSnafu { table_name })?;
 
-                let scan_and_filter = self.scan_and_filter(
-                    ctx.child_ctx("scan_and_filter planning"),
-                    table_name,
-                    schema,
-                    predicate,
-                    chunks,
-                )?;
+                let scan_and_filter = ScanPlanBuilder::new(schema)
+                    .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+                    .with_chunks(chunks)
+                    .with_predicate(predicate)
+                    .build()?;
 
-                // if we have any data to scan, make a plan!
-                if let Some(TableScanAndFilter {
-                    plan_builder,
-                    schema: _,
-                }) = scan_and_filter
-                {
-                    let tag_name_is_not_null = Expr::Column(tag_name.into()).is_not_null();
+                let tag_name_is_not_null = Expr::Column(tag_name.into()).is_not_null();
 
-                    // TODO: optimize this to use "DISINCT" or do
-                    // something more intelligent that simply fetching all
-                    // the values and reducing them in the query Executor
-                    //
-                    // Until then, simply use a plan which looks like:
-                    //
-                    //    Projection
-                    //      Filter(is not null)
-                    //        Filter(predicate)
-                    //          Scan
-                    let plan = plan_builder
-                        .project(select_exprs.clone())
-                        .context(BuildingPlanSnafu)?
-                        .filter(tag_name_is_not_null)
-                        .context(BuildingPlanSnafu)?
-                        .build()
-                        .context(BuildingPlanSnafu)?;
+                // TODO: optimize this to use "DISINCT" or do
+                // something more intelligent that simply fetching all
+                // the values and reducing them in the query Executor
+                //
+                // Until then, simply use a plan which looks like:
+                //
+                //    Projection
+                //      Filter(is not null)
+                //        Filter(predicate)
+                //          Scan
+                let plan = scan_and_filter
+                    .plan_builder
+                    .project(select_exprs.clone())
+                    .context(BuildingPlanSnafu)?
+                    .filter(tag_name_is_not_null)
+                    .context(BuildingPlanSnafu)?
+                    .build()
+                    .context(BuildingPlanSnafu)?;
 
-                    builder = builder.append_other(plan.into());
-                }
+                builder = builder.append_other(plan.into());
             }
         }
 
@@ -695,15 +671,14 @@ impl InfluxRpcPlanner {
                 .table_schema(table_name)
                 .context(TableRemovedSnafu { table_name })?;
 
-            if let Some(plan) = self.field_columns_plan(
+            let plan = self.field_columns_plan(
                 ctx.child_ctx("field_columns plan"),
-                table_name,
                 schema,
                 predicate,
                 chunks,
-            )? {
-                field_list_plan = field_list_plan.append(plan);
-            }
+            )?;
+
+            field_list_plan = field_list_plan.append(plan);
         }
 
         Ok(field_list_plan)
@@ -761,10 +736,7 @@ impl InfluxRpcPlanner {
                 predicate,
                 chunks,
             )?;
-            // If we have to do real work, add it to the list of plans
-            if let Some(ss_plan) = ss_plan {
-                ss_plans.push(ss_plan);
-            }
+            ss_plans.push(ss_plan);
         }
 
         Ok(SeriesSetPlans::new(ss_plans))
@@ -837,11 +809,7 @@ impl InfluxRpcPlanner {
                     chunks,
                 )?,
             };
-
-            // If we have to do real work, add it to the list of plans
-            if let Some(ss_plan) = ss_plan {
-                ss_plans.push(ss_plan);
-            }
+            ss_plans.push(ss_plan);
         }
 
         let plan = SeriesSetPlans::new(ss_plans);
@@ -905,11 +873,7 @@ impl InfluxRpcPlanner {
                 offset,
                 chunks,
             )?;
-
-            // If we have to do real work, add it to the list of plans
-            if let Some(ss_plan) = ss_plan {
-                ss_plans.push(ss_plan);
-            }
+            ss_plans.push(ss_plan);
         }
 
         Ok(SeriesSetPlans::new(ss_plans))
@@ -933,24 +897,15 @@ impl InfluxRpcPlanner {
         predicate: &Predicate,
         chunks: Vec<Arc<dyn QueryChunk>>,
     ) -> Result<Option<StringSetPlan>> {
-        let scan_and_filter = self.scan_and_filter(
-            ctx.child_ctx("scan_and_filter planning"),
-            table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
-
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
         // now, select only the tag columns
-        let select_exprs = schema
+        let select_exprs = scan_and_filter
+            .schema()
             .iter()
             .filter_map(|(influx_column_type, field)| {
                 if matches!(influx_column_type, Some(InfluxColumnType::Tag)) {
@@ -966,7 +921,8 @@ impl InfluxRpcPlanner {
             return Ok(None);
         }
 
-        let plan = plan_builder
+        let plan = scan_and_filter
+            .plan_builder
             .project(select_exprs)
             .context(BuildingPlanSnafu)?
             .build()
@@ -1000,28 +956,19 @@ impl InfluxRpcPlanner {
     fn field_columns_plan(
         &self,
         ctx: IOxSessionContext,
-        table_name: &str,
         schema: Arc<Schema>,
         predicate: &Predicate,
         chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<LogicalPlan>> {
-        let scan_and_filter = self.scan_and_filter(
-            ctx.child_ctx("scan_and_filter planning"),
-            table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
+    ) -> Result<LogicalPlan> {
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
         // Selection of only fields and time
-        let select_exprs = schema
+        let select_exprs = scan_and_filter
+            .schema()
             .iter()
             .filter_map(|(influx_column_type, field)| match influx_column_type {
                 Some(InfluxColumnType::Field(_)) => Some(col(field.name())),
@@ -1031,13 +978,14 @@ impl InfluxRpcPlanner {
             })
             .collect::<Vec<_>>();
 
-        let plan = plan_builder
+        let plan = scan_and_filter
+            .plan_builder
             .project(select_exprs)
             .context(BuildingPlanSnafu)?
             .build()
             .context(BuildingPlanSnafu)?;
 
-        Ok(Some(plan))
+        Ok(plan)
     }
 
     /// Creates a DataFusion LogicalPlan that returns the values in
@@ -1065,29 +1013,21 @@ impl InfluxRpcPlanner {
         schema: Arc<Schema>,
         predicate: &Predicate,
         chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<LogicalPlan> {
         debug!(%table_name, "Creating table_name full plan");
-        let scan_and_filter = self.scan_and_filter(
-            self.ctx.child_ctx("scan_and_filter planning"),
-            table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(self.ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
         // Select only fields requested
-        let select_exprs: Vec<_> = filtered_fields_iter(&schema, predicate)
+        let select_exprs: Vec<_> = filtered_fields_iter(&scan_and_filter.schema(), predicate)
             .map(|field| col(field.name))
             .collect();
 
-        let plan = plan_builder
+        let plan = scan_and_filter
+            .plan_builder
             .project(select_exprs)
             .context(BuildingPlanSnafu)?
             .build()
@@ -1096,7 +1036,7 @@ impl InfluxRpcPlanner {
         // Add the final node that outputs the table name or not, depending
         let plan = make_non_null_checker(table_name, plan);
 
-        Ok(Some(plan))
+        Ok(plan)
     }
 
     /// Creates a plan for computing series sets for a given table,
@@ -1116,38 +1056,31 @@ impl InfluxRpcPlanner {
         schema: Arc<Schema>,
         predicate: &Predicate,
         chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<SeriesSetPlan>> {
+    ) -> Result<SeriesSetPlan> {
         let table_name = table_name.as_ref();
-        let scan_and_filter = self.scan_and_filter(
-            ctx.child_ctx("scan_and_filter planning"),
-            table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
-
-        let tags_and_timestamp: Vec<_> = schema
+        let tags_and_timestamp: Vec<_> = scan_and_filter
+            .schema()
             .tags_iter()
-            .chain(schema.time_iter())
+            .chain(scan_and_filter.schema().time_iter())
             .map(|f| f.name() as &str)
             // Convert to SortExprs to pass to the plan builder
             .map(|n| n.as_sort_expr())
             .collect();
 
         // Order by
-        let plan_builder = plan_builder
+        let plan_builder = scan_and_filter
+            .plan_builder
             .sort(tags_and_timestamp)
             .context(BuildingPlanSnafu)?;
 
         // Select away anything that isn't in the influx data model
+        let schema = scan_and_filter.schema();
         let tags_fields_and_timestamps: Vec<Expr> = schema
             .tags_iter()
             .map(|field| field.name().as_expr())
@@ -1179,7 +1112,7 @@ impl InfluxRpcPlanner {
             field_columns,
         );
 
-        Ok(Some(ss_plan))
+        Ok(ss_plan)
     }
 
     /// Creates a GroupedSeriesSet plan that produces an output table
@@ -1230,26 +1163,17 @@ impl InfluxRpcPlanner {
         predicate: &Predicate,
         agg: Aggregate,
         chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<SeriesSetPlan>> {
-        let scan_and_filter = self.scan_and_filter(
-            ctx.child_ctx("scan_and_filter planning"),
-            table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
-
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
+    ) -> Result<SeriesSetPlan> {
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
         // order the tag columns so that the group keys come first (we
         // will group and
         // order in the same order)
+        let schema = scan_and_filter.schema();
         let tag_columns: Vec<_> = schema.tags_iter().map(|f| f.name() as &str).collect();
 
         // Group by all tag columns
@@ -1263,7 +1187,8 @@ impl InfluxRpcPlanner {
             field_columns,
         } = AggExprs::try_new_for_read_group(agg, &schema, predicate)?;
 
-        let plan_builder = plan_builder
+        let plan_builder = scan_and_filter
+            .plan_builder
             .aggregate(group_exprs, agg_exprs)
             .context(BuildingPlanSnafu)?;
 
@@ -1305,7 +1230,7 @@ impl InfluxRpcPlanner {
             field_columns,
         );
 
-        Ok(Some(ss_plan))
+        Ok(ss_plan)
     }
 
     /// Creates a SeriesSetPlan that produces an output table with rows
@@ -1347,23 +1272,15 @@ impl InfluxRpcPlanner {
         every: WindowDuration,
         offset: WindowDuration,
         chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<SeriesSetPlan>> {
+    ) -> Result<SeriesSetPlan> {
         let table_name = table_name.into();
-        let scan_and_filter = self.scan_and_filter(
-            ctx.child_ctx("scan_and_filter planning"),
-            &table_name,
-            schema,
-            predicate,
-            chunks,
-        )?;
+        let scan_and_filter = ScanPlanBuilder::new(schema)
+            .with_session_context(ctx.child_ctx("scan_and_filter planning"))
+            .with_predicate(predicate)
+            .with_chunks(chunks)
+            .build()?;
 
-        let TableScanAndFilter {
-            plan_builder,
-            schema,
-        } = match scan_and_filter {
-            None => return Ok(None),
-            Some(t) => t,
-        };
+        let schema = scan_and_filter.schema();
 
         // Group by all tag columns and the window bounds
         let window_bound = make_window_bound_expr(TIME_COLUMN_NAME.as_expr(), every, offset)
@@ -1386,111 +1303,27 @@ impl InfluxRpcPlanner {
             .map(|expr| expr.as_sort_expr())
             .collect::<Vec<_>>();
 
-        let plan_builder = plan_builder
-            .aggregate(group_exprs, agg_exprs)
-            .context(BuildingPlanSnafu)?
-            .sort(sort_exprs)
-            .context(BuildingPlanSnafu)?;
+        let plan_builder = scan_and_filter
+            .plan_builder
+            .aggregate(group_exprs, agg_exprs)?
+            .sort(sort_exprs)?;
 
         let plan_builder = cast_aggregates(plan_builder, agg, &field_columns)?;
 
         // and finally create the plan
-        let plan = plan_builder.build().context(BuildingPlanSnafu)?;
+        let plan = plan_builder.build()?;
 
         let tag_columns = schema
             .tags_iter()
             .map(|field| Arc::from(field.name().as_str()))
             .collect();
 
-        Ok(Some(SeriesSetPlan::new(
+        Ok(SeriesSetPlan::new(
             Arc::from(table_name),
             plan,
             tag_columns,
             field_columns,
-        )))
-    }
-
-    /// Create a plan that scans the specified table, and applies any
-    /// filtering specified on the predicate, if any.
-    ///
-    /// If the table can produce no rows based on predicate
-    /// evaluation, returns Ok(None)
-    ///
-    /// The created plan looks like:
-    ///
-    /// ```text
-    ///   Filter(predicate) [optional]
-    ///     Scan
-    /// ```
-    fn scan_and_filter(
-        &self,
-        ctx: IOxSessionContext,
-        table_name: &str,
-        schema: Arc<Schema>,
-        predicate: &Predicate,
-        chunks: Vec<Arc<dyn QueryChunk>>,
-    ) -> Result<Option<TableScanAndFilter>> {
-        // Scan all columns to begin with (DataFusion projection
-        // push-down optimization will prune out unneeded columns later)
-        let projection = None;
-
-        // Prepare the scan of the table
-        let mut builder = ProviderBuilder::new(table_name, schema)
-            .with_execution_context(ctx.child_ctx("provider_builder"));
-
-        // Since the entire predicate is used in the call to
-        // `database.chunks()` there will not be any additional
-        // predicates that get pushed down here
-        //
-        // However, in the future if DataFusion adds extra synthetic
-        // predicates that could be pushed down and used for
-        // additional pruning we may want to add an extra layer of
-        // pruning here.
-        builder = builder.add_no_op_pruner();
-
-        for chunk in chunks {
-            // check that it is consistent with this table_name
-            assert_eq!(
-                chunk.table_name(),
-                table_name,
-                "Chunk {} expected table mismatch",
-                chunk.id(),
-            );
-
-            builder = builder.add_chunk(chunk);
-        }
-
-        let provider = builder
-            .build()
-            .context(CreatingProviderSnafu { table_name })?;
-        let schema = provider.iox_schema();
-
-        let source = provider_as_source(Arc::new(provider));
-
-        let mut plan_builder =
-            LogicalPlanBuilder::scan(table_name, source, projection).context(BuildingPlanSnafu)?;
-
-        // Use a filter node to add general predicates + timestamp
-        // range, if any
-        if let Some(filter_expr) = predicate.filter_expr() {
-            // Rewrite expression so it only refers to columns in this chunk
-            trace!(table_name, ?filter_expr, "Adding filter expr");
-            let mut rewriter = MissingColumnsToNull::new(&schema);
-            let filter_expr = filter_expr
-                .rewrite(&mut rewriter)
-                .context(RewritingFilterPredicateSnafu { table_name })?;
-
-            trace!(?filter_expr, "Rewritten filter_expr");
-
-            plan_builder = plan_builder
-                .filter(filter_expr)
-                .context(BuildingPlanSnafu)?;
-        }
-
-        Ok(Some(TableScanAndFilter {
-            plan_builder,
-            schema,
-        }))
+        ))
     }
 }
 
@@ -1585,13 +1418,6 @@ fn cast_aggregates(
         .collect::<Result<Vec<_>>>()?;
 
     plan_builder.project(cast_exprs).context(BuildingPlanSnafu)
-}
-
-struct TableScanAndFilter {
-    /// Represents plan that scans a table and applies optional filtering
-    plan_builder: LogicalPlanBuilder,
-    /// The IOx schema of the result
-    schema: Arc<Schema>,
 }
 
 /// Helper for creating aggregates
@@ -1860,7 +1686,7 @@ fn make_selector_expr<'a>(
 mod tests {
     use datafusion::logical_plan::lit;
     use futures::{future::BoxFuture, FutureExt};
-    use predicate::PredicateBuilder;
+    use predicate::Predicate;
 
     use crate::{
         exec::Executor,
@@ -1991,13 +1817,11 @@ mod tests {
         let expr = when(col("foo").is_null(), lit(""))
             .otherwise(col("foo"))
             .unwrap();
-        let silly_predicate = PredicateBuilder::new()
-            .add_expr(expr.eq(lit("bar")))
-            .build();
+        let silly_predicate = Predicate::new().with_expr(expr.eq(lit("bar")));
 
         // verify that the predicate was rewritten to `foo = 'bar'`
         let expr = col("foo").eq(lit("bar"));
-        let expected_predicate = PredicateBuilder::new().add_expr(expr).build();
+        let expected_predicate = Predicate::new().with_expr(expr);
 
         run_test_with_predicate(&func, silly_predicate, expected_predicate).await;
 
@@ -2006,15 +1830,13 @@ mod tests {
         //
         // https://github.com/influxdata/influxdb_iox/issues/3601
         // _measurement = 'foo'
-        let silly_predicate = PredicateBuilder::new()
-            .add_expr(col("_measurement").eq(lit("foo")))
-            .build();
+        let silly_predicate = Predicate::new().with_expr(col("_measurement").eq(lit("foo")));
 
         // verify that the predicate was rewritten to `false` as the
         // measurement name is `h20`
         let expr = lit(false);
 
-        let expected_predicate = PredicateBuilder::new().add_expr(expr).build();
+        let expected_predicate = Predicate::new().with_expr(expr);
         run_test_with_predicate(&func, silly_predicate, expected_predicate).await;
 
         // ------------- Test 3 ----------------
@@ -2022,19 +1844,17 @@ mod tests {
         //
         // https://github.com/influxdata/influxdb_iox/issues/3601
         // (_measurement = 'foo' or measurement = 'h2o') AND time > 5
-        let silly_predicate = PredicateBuilder::new()
-            .add_expr(
-                col("_measurement")
-                    .eq(lit("foo"))
-                    .or(col("_measurement").eq(lit("h2o")))
-                    .and(col("time").gt(lit(5))),
-            )
-            .build();
+        let silly_predicate = Predicate::new().with_expr(
+            col("_measurement")
+                .eq(lit("foo"))
+                .or(col("_measurement").eq(lit("h2o")))
+                .and(col("time").gt(lit(5))),
+        );
 
         // verify that the predicate was rewritten to time > 5
         let expr = col("time").gt(lit(5));
 
-        let expected_predicate = PredicateBuilder::new().add_expr(expr).build();
+        let expected_predicate = Predicate::new().with_expr(expr);
         run_test_with_predicate(&func, silly_predicate, expected_predicate).await;
     }
 

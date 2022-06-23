@@ -3,7 +3,6 @@
 use crate::{
     data::{IngesterData, IngesterQueryResponse, SequencerData},
     lifecycle::{run_lifecycle_manager, LifecycleConfig, LifecycleManager},
-    partioning::DefaultPartitioner,
     poison::PoisonCabinet,
     querier_handler::prepare_data_to_querier,
     stream_handler::{
@@ -13,7 +12,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use backoff::BackoffConfig;
-use data_types::{KafkaPartition, KafkaTopic, SequenceNumber, Sequencer};
+use data_types::{KafkaPartition, KafkaTopic, Sequencer};
 use futures::{
     future::{BoxFuture, Shared},
     stream::FuturesUnordered,
@@ -23,7 +22,7 @@ use generated_types::ingester::IngesterQueryRequest;
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
 use iox_time::{SystemProvider, TimeProvider};
-use metric::{Metric, U64Counter, U64Histogram, U64HistogramOptions};
+use metric::{DurationHistogram, Metric, U64Counter};
 use object_store::DynObjectStore;
 use observability_deps::tracing::*;
 use snafu::{ResultExt, Snafu};
@@ -109,9 +108,14 @@ pub struct IngestHandlerImpl<T = SystemProvider> {
 
     time_provider: T,
 
-    /// Query execution duration distribution (milliseconds).
-    query_duration_success_ms: U64Histogram,
-    query_duration_error_ms: U64Histogram,
+    /// Query execution duration distribution for successes.
+    query_duration_success: DurationHistogram,
+
+    /// Query execution duration distribution for "not found" errors
+    query_duration_error_not_found: DurationHistogram,
+
+    /// Query execution duration distribution for all other errors
+    query_duration_error_other: DurationHistogram,
 
     /// Query request rejected due to concurrency limits
     query_request_limit_rejected: U64Counter,
@@ -151,7 +155,6 @@ impl IngestHandlerImpl {
             object_store,
             catalog,
             sequencers,
-            Arc::new(DefaultPartitioner::default()),
             exec,
             BackoffConfig::default(),
         ));
@@ -193,11 +196,11 @@ impl IngestHandlerImpl {
                 .context(WriteBufferSnafu)?;
             debug!(
                 kafka_partition = kafka_partition.get(),
-                min_unpersisted_sequence_number = sequencer.min_unpersisted_sequence_number,
+                min_unpersisted_sequence_number = sequencer.min_unpersisted_sequence_number.get(),
                 "Seek stream",
             );
             op_stream
-                .seek(sequencer.min_unpersisted_sequence_number as u64)
+                .seek(sequencer.min_unpersisted_sequence_number)
                 .await
                 .context(WriteBufferSnafu)?;
 
@@ -232,7 +235,7 @@ impl IngestHandlerImpl {
                 async move {
                     let handler = SequencedStreamHandler::new(
                         op_stream,
-                        SequenceNumber::new(sequencer.min_unpersisted_sequence_number),
+                        sequencer.min_unpersisted_sequence_number,
                         sink,
                         lifecycle_handle,
                         kafka_topic_name,
@@ -250,30 +253,14 @@ impl IngestHandlerImpl {
         }
 
         // Record query duration metrics, broken down by query execution result
-        let query_duration: Metric<U64Histogram> = metric_registry.register_metric_with_options(
-            "flight_query_duration_ms",
-            "flight request query execution duration in milliseconds",
-            || {
-                U64HistogramOptions::new([
-                    5,
-                    10,
-                    20,
-                    40,
-                    80,
-                    160,
-                    320,
-                    640,
-                    1280,
-                    2560,
-                    5120,
-                    10240,
-                    20480,
-                    u64::MAX,
-                ])
-            },
+        let query_duration: Metric<DurationHistogram> = metric_registry.register_metric(
+            "ingester_flight_query_duration",
+            "flight request query execution duration",
         );
-        let query_duration_success_ms = query_duration.recorder(&[("result", "success")]);
-        let query_duration_error_ms = query_duration.recorder(&[("result", "error")]);
+        let query_duration_success = query_duration.recorder(&[("result", "success")]);
+        let query_duration_error_not_found =
+            query_duration.recorder(&[("result", "error_not_found")]);
+        let query_duration_error_other = query_duration.recorder(&[("result", "error_other")]);
 
         let query_request_limit_rejected = metric_registry
             .register_metric::<U64Counter>(
@@ -287,8 +274,9 @@ impl IngestHandlerImpl {
             kafka_topic: topic,
             join_handles,
             shutdown,
-            query_duration_success_ms,
-            query_duration_error_ms,
+            query_duration_success,
+            query_duration_error_not_found,
+            query_duration_error_other,
             query_request_limit_rejected,
             request_sem: Semaphore::new(max_requests),
             time_provider: Default::default(),
@@ -320,15 +308,27 @@ impl IngestHandler for IngestHandlerImpl {
             Err(e) => panic!("request limiter error: {}", e),
         };
 
+        // TEMP(alamb): Log details about what was requested
+        // temporarily so we can track down potentially "killer"
+        // requests from the querier to ingester
+        info!(namespace=%request.namespace,
+              table=%request.table,
+              columns=?request.columns,
+              predicate=?request.predicate,
+              "Handling querier request");
+
         let t = self.time_provider.now();
+        let request = Arc::new(request);
         let res = prepare_data_to_querier(&self.data, &request).await;
 
         if let Some(delta) = self.time_provider.now().checked_duration_since(t) {
             match &res {
-                Ok(_) => self
-                    .query_duration_success_ms
-                    .record(delta.as_millis() as _),
-                Err(_) => self.query_duration_error_ms.record(delta.as_millis() as _),
+                Ok(_) => self.query_duration_success.record(delta),
+                Err(crate::querier_handler::Error::TableNotFound { .. })
+                | Err(crate::querier_handler::Error::NamespaceNotFound { .. }) => {
+                    self.query_duration_error_not_found.record(delta)
+                }
+                Err(_) => self.query_duration_error_other.record(delta),
             };
         }
 
@@ -397,7 +397,7 @@ mod tests {
     use dml::{DmlMeta, DmlWrite};
     use iox_catalog::{mem::MemCatalog, validate_or_insert_schema};
     use iox_time::Time;
-    use metric::{Attributes, Metric, U64Counter, U64Gauge, U64Histogram};
+    use metric::{Attributes, Metric, U64Counter, U64Gauge};
     use mutable_batch_lp::lines_to_batches;
     use object_store::memory::InMemory;
     use std::{num::NonZeroU32, ops::DerefMut};
@@ -418,7 +418,13 @@ mod tests {
         let w1 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(0, 0), ingest_ts1, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(0, SequenceNumber::new(0)),
+                ingest_ts1,
+                None,
+                50,
+            ),
         );
         let schema = validate_or_insert_schema(w1.tables(), &schema, txn.deref_mut())
             .await
@@ -428,7 +434,13 @@ mod tests {
         let w2 = DmlWrite::new(
             "foo",
             lines_to_batches("cpu bar=2 20\ncpu bar=3 30", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(0, 7), ingest_ts2, None, 150),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(0, SequenceNumber::new(7)),
+                ingest_ts2,
+                None,
+                150,
+            ),
         );
         let _schema = validate_or_insert_schema(w2.tables(), &schema, txn.deref_mut())
             .await
@@ -438,7 +450,13 @@ mod tests {
         let w3 = DmlWrite::new(
             "foo",
             lines_to_batches("a b=2 200", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(0, 9), ingest_ts2, None, 150),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(0, SequenceNumber::new(9)),
+                ingest_ts2,
+                None,
+                150,
+            ),
         );
         let _schema = validate_or_insert_schema(w3.tables(), &schema, txn.deref_mut())
             .await
@@ -456,7 +474,7 @@ mod tests {
                 if let Some(data) = ingester.ingester.data.sequencer(ingester.sequencer.id) {
                     if let Some(data) = data.namespace(&ingester.namespace.name) {
                         // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("a", "1970-01-01").await {
+                        if let Some((b, _)) = data.snapshot("a", &"1970-01-01".into()).await {
                             if let Some(b) = b.first() {
                                 if b.data.num_rows() > 0 {
                                     has_measurement = true;
@@ -476,7 +494,8 @@ mod tests {
                     .await
                     .unwrap();
 
-                if has_measurement && seq.min_unpersisted_sequence_number == 9 {
+                if has_measurement && seq.min_unpersisted_sequence_number == SequenceNumber::new(9)
+                {
                     break;
                 }
 
@@ -488,7 +507,7 @@ mod tests {
 
         let observation = ingester
             .metrics
-            .get_instrument::<Metric<U64Histogram>>("ingester_op_apply_duration_ms")
+            .get_instrument::<Metric<DurationHistogram>>("ingester_op_apply_duration")
             .unwrap()
             .get_observer(&Attributes::from(&[
                 ("kafka_topic", "whatevs"),
@@ -502,7 +521,7 @@ mod tests {
 
         let observation = ingester
             .metrics
-            .get_instrument::<Metric<U64Counter>>("write_buffer_read_bytes")
+            .get_instrument::<Metric<U64Counter>>("ingester_write_buffer_read_bytes")
             .unwrap()
             .get_observer(&Attributes::from(&[
                 ("kafka_topic", "whatevs"),
@@ -514,7 +533,7 @@ mod tests {
 
         let observation = ingester
             .metrics
-            .get_instrument::<Metric<U64Gauge>>("write_buffer_last_sequence_number")
+            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_sequence_number")
             .unwrap()
             .get_observer(&Attributes::from(&[
                 ("kafka_topic", "whatevs"),
@@ -526,7 +545,7 @@ mod tests {
 
         let observation = ingester
             .metrics
-            .get_instrument::<Metric<U64Gauge>>("write_buffer_sequence_number_lag")
+            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_sequence_number_lag")
             .unwrap()
             .get_observer(&Attributes::from(&[
                 ("kafka_topic", "whatevs"),
@@ -538,7 +557,7 @@ mod tests {
 
         let observation = ingester
             .metrics
-            .get_instrument::<Metric<U64Gauge>>("write_buffer_last_ingest_ts")
+            .get_instrument::<Metric<U64Gauge>>("ingester_write_buffer_last_ingest_ts")
             .unwrap()
             .get_observer(&Attributes::from(&[
                 ("kafka_topic", "whatevs"),
@@ -623,7 +642,8 @@ mod tests {
             .await
             .unwrap();
         // update the min unpersisted
-        sequencer.min_unpersisted_sequence_number = min_unpersisted_sequence_number;
+        sequencer.min_unpersisted_sequence_number =
+            SequenceNumber::new(min_unpersisted_sequence_number);
         // this probably isn't necessary, but just in case something changes later
         txn.sequencers()
             .update_min_unpersisted_sequence_number(
@@ -693,7 +713,7 @@ mod tests {
                 if let Some(data) = ingester.data.sequencer(sequencer.id) {
                     if let Some(data) = data.namespace(&namespace.name) {
                         // verify there's data in the buffer
-                        if let Some((b, _)) = data.snapshot("cpu", "1970-01-01").await {
+                        if let Some((b, _)) = data.snapshot("cpu", &"1970-01-01".into()).await {
                             if let Some(b) = b.first() {
                                 custom_batch_verification(b);
 
@@ -724,12 +744,24 @@ mod tests {
             DmlWrite::new(
                 "foo",
                 lines_to_batches("cpu bar=2 20", 0).unwrap(),
-                DmlMeta::sequenced(Sequence::new(0, 1), ingest_ts1, None, 150),
+                Some("1970-01-01".into()),
+                DmlMeta::sequenced(
+                    Sequence::new(0, SequenceNumber::new(1)),
+                    ingest_ts1,
+                    None,
+                    150,
+                ),
             ),
             DmlWrite::new(
                 "foo",
                 lines_to_batches("cpu bar=2 30", 0).unwrap(),
-                DmlMeta::sequenced(Sequence::new(0, 2), ingest_ts2, None, 150),
+                Some("1970-01-01".into()),
+                DmlMeta::sequenced(
+                    Sequence::new(0, SequenceNumber::new(2)),
+                    ingest_ts2,
+                    None,
+                    150,
+                ),
             ),
         ];
 
@@ -765,7 +797,13 @@ mod tests {
         let write_operations = vec![DmlWrite::new(
             "foo",
             lines_to_batches("cpu bar=2 20", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(0, 1), ingest_ts1, None, 150),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(0, SequenceNumber::new(1)),
+                ingest_ts1,
+                None,
+                150,
+            ),
         )];
 
         // Set the min unpersisted to something bigger than the write's sequence number to

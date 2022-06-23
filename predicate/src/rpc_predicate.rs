@@ -85,7 +85,7 @@ impl InfluxRpcPredicate {
     /// existing storage engine
     pub fn clear_timestamp_if_max_range(self) -> Self {
         Self {
-            inner: self.inner.clear_timestamp_if_max_range(),
+            inner: self.inner.with_clear_timestamp_if_max_range(),
             ..self
         }
     }
@@ -203,10 +203,10 @@ fn normalize_predicate(
     // Store any field value (`_value`) expressions on the `Predicate`.
     predicate.value_expr = field_value_exprs;
 
-    match field_projections.into_projection() {
-        FieldProjection::None => {}
+    let predicate = match field_projections.into_projection() {
+        FieldProjection::None => predicate,
         FieldProjection::Include(include_field_names) => {
-            predicate.add_field_names(include_field_names)
+            predicate.with_field_columns(include_field_names)
         }
         FieldProjection::Exclude(exclude_field_names) => {
             // if we don't have the schema, it means the table doesn't exist so we can safely ignore
@@ -222,10 +222,12 @@ fn normalize_predicate(
                     }
                 });
 
-                predicate.add_field_names(new_fields)
+                predicate.with_field_columns(new_fields)
+            } else {
+                predicate
             }
         }
-    }
+    };
     Ok(predicate)
 }
 
@@ -288,7 +290,7 @@ impl<'a> ExprSchema for SimplifyAdapter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::PredicateBuilder;
+    use crate::Predicate;
 
     use super::*;
     use arrow::datatypes::DataType;
@@ -300,16 +302,13 @@ mod tests {
         let predicate = normalize_predicate(
             "table",
             Some(schema()),
-            &PredicateBuilder::new()
-                .add_expr(col("_field").eq(lit("f1")))
-                .build(),
+            &Predicate::new().with_expr(col("_field").eq(lit("f1"))),
         )
         .unwrap();
 
-        let expected = PredicateBuilder::new()
-            .field_columns(vec!["f1"])
-            .add_expr(lit(true))
-            .build();
+        let expected = Predicate::new()
+            .with_field_columns(vec!["f1"])
+            .with_expr(lit(true));
 
         assert_eq!(predicate, expected);
     }
@@ -319,16 +318,14 @@ mod tests {
         let predicate = normalize_predicate(
             "table",
             Some(schema()),
-            &PredicateBuilder::new()
-                .add_expr(col("_field").eq(lit("f1")).or(col("_field").eq(lit("f2"))))
-                .build(),
+            &Predicate::new()
+                .with_expr(col("_field").eq(lit("f1")).or(col("_field").eq(lit("f2")))),
         )
         .unwrap();
 
-        let expected = PredicateBuilder::new()
-            .field_columns(vec!["f1", "f2"])
-            .add_expr(lit(true))
-            .build();
+        let expected = Predicate::new()
+            .with_field_columns(vec!["f1", "f2"])
+            .with_expr(lit(true));
 
         assert_eq!(predicate, expected);
     }
@@ -338,10 +335,9 @@ mod tests {
         let err = normalize_predicate(
             "table",
             Some(schema()),
-            &PredicateBuilder::new()
+            &Predicate::new()
                 // predicate is connected with `and` which is not supported
-                .add_expr(col("_field").eq(lit("f1")).and(col("_field").eq(lit("f2"))))
-                .build(),
+                .with_expr(col("_field").eq(lit("f1")).and(col("_field").eq(lit("f2")))),
         )
         .unwrap_err();
 
@@ -355,16 +351,13 @@ mod tests {
         let predicate = normalize_predicate(
             "table",
             Some(schema()),
-            &PredicateBuilder::new()
-                .add_expr(col("_field").not_eq(lit("f1")))
-                .build(),
+            &Predicate::new().with_expr(col("_field").not_eq(lit("f1"))),
         )
         .unwrap();
 
-        let expected = PredicateBuilder::new()
-            .field_columns(vec!["f2"])
-            .add_expr(lit(true))
-            .build();
+        let expected = Predicate::new()
+            .with_field_columns(vec!["f2"])
+            .with_expr(lit(true));
 
         assert_eq!(predicate, expected);
     }
@@ -374,11 +367,10 @@ mod tests {
         let err = normalize_predicate(
             "table",
             Some(schema()),
-            &PredicateBuilder::new()
+            &Predicate::new()
                 // put = and != predicates in *different* exprs
-                .add_expr(col("_field").eq(lit("f1")))
-                .add_expr(col("_field").not_eq(lit("f2")))
-                .build(),
+                .with_expr(col("_field").eq(lit("f1")))
+                .with_expr(col("_field").not_eq(lit("f2"))),
         )
         .unwrap_err();
 

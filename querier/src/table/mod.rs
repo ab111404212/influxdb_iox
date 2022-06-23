@@ -121,7 +121,12 @@ impl QuerierTable {
     ///
     /// This currently contains all parquet files linked to their unprocessed tombstones.
     pub async fn chunks(&self, predicate: &Predicate) -> Result<Vec<Arc<dyn QueryChunk>>> {
-        debug!(?predicate, namespace=%self.namespace_name, table_name=%self.table_name(), "Fetching all chunks");
+        debug!(
+            ?predicate,
+            namespace=%self.namespace_name,
+            table_name=%self.table_name(),
+            "Fetching all chunks"
+        );
 
         let catalog_cache = self.chunk_adapter.catalog_cache();
 
@@ -179,7 +184,7 @@ impl QuerierTable {
             .collect();
 
         // get any chunks from the ingster
-        let partitions = self
+        let partitions_result = self
             .ingester_connection
             .partitions(
                 Arc::clone(&self.namespace_name),
@@ -189,7 +194,9 @@ impl QuerierTable {
                 Arc::clone(&self.schema),
             )
             .await
-            .context(GettingIngesterPartitionsSnafu)?;
+            .context(GettingIngesterPartitionsSnafu);
+
+        let partitions = partitions_result?;
 
         // check that partitions from ingesters don't overlap
         let mut seen = HashMap::with_capacity(partitions.len());
@@ -269,20 +276,18 @@ impl QuerierTable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use assert_matches::assert_matches;
-    use data_types::{ChunkId, ColumnType, SequenceNumber};
-    use iox_tests::util::{now, TestCatalog, TestTable};
-    use predicate::Predicate;
-    use schema::{builder::SchemaBuilder, InfluxFieldType};
-    use test_helpers::maybe_start_logging;
-
     use super::*;
     use crate::{
         ingester::{test_util::MockIngesterConnection, IngesterPartition},
         table::test_util::{querier_table, IngesterPartitionBuilder},
     };
+    use assert_matches::assert_matches;
+    use data_types::{ChunkId, ColumnType, SequenceNumber};
+    use iox_tests::util::{now, TestCatalog, TestTable};
+    use predicate::Predicate;
+    use schema::{builder::SchemaBuilder, InfluxFieldType};
+    use std::sync::Arc;
+    use test_helpers::maybe_start_logging;
 
     #[tokio::test]
     async fn test_parquet_chunks() {
@@ -310,8 +315,10 @@ mod tests {
             .create_partition("k")
             .await;
 
-        table1.create_column("foo", ColumnType::I64).await;
-        table2.create_column("foo", ColumnType::I64).await;
+        table1.create_column("time", ColumnType::Time).await;
+        table1.create_column("foo", ColumnType::F64).await;
+        table2.create_column("time", ColumnType::Time).await;
+        table2.create_column("foo", ColumnType::F64).await;
 
         let querier_table = TestQuerierTable::new(&catalog, &table1).await;
 
@@ -437,7 +444,7 @@ mod tests {
             .create_parquet_file_with_min_max("table foo=1 11", 1, 2, now_nanos(), now_nanos())
             .await;
 
-        let builder = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition);
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition);
         let ingester_partition =
             builder.build_with_max_parquet_sequence_number(Some(SequenceNumber::new(1)));
 
@@ -453,7 +460,6 @@ mod tests {
     async fn test_state_reconcile() {
         maybe_start_logging();
         let catalog = TestCatalog::new();
-
         let ns = catalog.create_namespace("ns").await;
         let table = ns.create_table("table").await;
         let sequencer = ns.create_sequencer(1).await;
@@ -465,6 +471,8 @@ mod tests {
             .with_sequencer(&sequencer)
             .create_partition("k2")
             .await;
+        table.create_column("time", ColumnType::Time).await;
+        table.create_column("foo", ColumnType::F64).await;
 
         // kept because max sequence number <= 2
         let file1 = partition1
@@ -517,8 +525,8 @@ mod tests {
 
         let ingester_chunk_id1 = u128::MAX - 1;
 
-        let builder1 = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition2);
+        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition1);
+        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition2);
 
         let querier_table = TestQuerierTable::new(&catalog, &table)
             .await
@@ -595,8 +603,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let builder1 = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition1);
-        let builder2 = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition2);
+        let builder1 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition1);
+        let builder2 = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition2);
 
         let querier_table = TestQuerierTable::new(&catalog, &table)
             .await
@@ -647,8 +655,8 @@ mod tests {
         let partition = table.with_sequencer(&sequencer).create_partition("k").await;
         let schema = make_schema(&table).await;
 
-        let builder = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition)
-            .with_lp(["table foo=1i 1"]);
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition)
+            .with_lp(["table foo=1 1"]);
 
         // Parquet file between with max sequence number 2
         partition
@@ -702,8 +710,8 @@ mod tests {
         // Expect 1 chunk with with one delete predicate
         let querier_table = TestQuerierTable::new(&catalog, &table).await;
 
-        let builder = IngesterPartitionBuilder::new(&ns, &table, &schema, &sequencer, &partition)
-            .with_lp(["table foo=1i 1"]);
+        let builder = IngesterPartitionBuilder::new(&table, &schema, &sequencer, &partition)
+            .with_lp(["table foo=1 1"]);
 
         // parquet file with max sequence number 1
         partition
@@ -752,11 +760,12 @@ mod tests {
 
     /// Adds a "foo" column to the table and returns the created schema
     async fn make_schema(table: &Arc<TestTable>) -> Arc<Schema> {
-        table.create_column("foo", ColumnType::I64).await;
+        table.create_column("foo", ColumnType::F64).await;
+        table.create_column("time", ColumnType::Time).await;
         // create corresponding schema
         Arc::new(
             SchemaBuilder::new()
-                .influx_field("foo", InfluxFieldType::Integer)
+                .influx_field("foo", InfluxFieldType::Float)
                 .timestamp()
                 .build()
                 .unwrap(),

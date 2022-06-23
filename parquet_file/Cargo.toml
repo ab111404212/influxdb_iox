@@ -5,7 +5,7 @@ authors = ["Nga Tran <nga-tran@live.com>"]
 edition = "2021"
 
 [dependencies] # In alphabetical order
-arrow = { version = "15.0.0", features = ["prettyprint"] }
+arrow = { version = "16.0.0", features = ["prettyprint"] }
 base64 = "0.13"
 bytes = "1.0"
 data_types = { path = "../data_types" }
@@ -14,11 +14,10 @@ datafusion_util = { path = "../datafusion_util" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
 iox_time = { path = "../iox_time" }
-metric = { path = "../metric" }
 object_store = "0.0.1"
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
-parquet = {version = "15.0.0", features = ["experimental"]}
+parquet = {version = "16.0.0", features = ["experimental"]}
 parquet-format = "4.0"
 pbjson-types = "0.3"
 predicate = { path = "../predicate" }
@@ -26,8 +25,8 @@ prost = "0.10"
 schema = { path = "../schema" }
 snafu = "0.7"
 thrift = "0.13"
-tokio = { version = "1.18", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
-uuid = { version = "0.8", features = ["v4"] }
+tokio = { version = "1.19", features = ["macros", "parking_lot", "rt", "rt-multi-thread", "sync"] }
+uuid = { version = "1", features = ["v4"] }
 zstd = "0.11"
 workspace-hack = { path = "../workspace-hack"}
 thiserror = "1.0.31"

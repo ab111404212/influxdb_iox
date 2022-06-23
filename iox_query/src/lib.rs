@@ -33,6 +33,7 @@ pub mod statistics;
 pub mod util;
 
 pub use exec::context::{DEFAULT_CATALOG, DEFAULT_SCHEMA};
+pub use frontend::common::ScanPlanBuilder;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// Trait for an object (designed to be a Chunk) which can provide
@@ -241,7 +242,7 @@ pub trait QueryChunk: QueryChunkMeta + Debug + Send + Sync + 'static {
         selection: Selection<'_>,
     ) -> Result<SendableRecordBatchStream, QueryChunkError>;
 
-    /// Returns chunk type which is either MUB, RUB, OS
+    /// Returns chunk type. Useful in tests and debug logs.
     fn chunk_type(&self) -> &str;
 
     /// Order of this chunk relative to other overlapping chunks.

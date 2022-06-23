@@ -2,19 +2,16 @@
 
 #![allow(missing_docs)]
 
-use crate::{
-    data::{
-        IngesterData, NamespaceData, PartitionData, PersistingBatch, QueryableBatch, SequencerData,
-        SnapshotBatch, TableData,
-    },
-    partioning::DefaultPartitioner,
+use crate::data::{
+    IngesterData, NamespaceData, PartitionData, PersistingBatch, QueryableBatch, SequencerData,
+    SnapshotBatch, TableData,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_eq;
 use bitflags::bitflags;
 use data_types::{
-    KafkaPartition, NamespaceId, PartitionId, SequenceNumber, SequencerId, TableId, Timestamp,
-    Tombstone, TombstoneId,
+    KafkaPartition, NamespaceId, PartitionId, PartitionKey, SequenceNumber, SequencerId, TableId,
+    Timestamp, Tombstone, TombstoneId,
 };
 use iox_catalog::{
     interface::{Catalog, INITIAL_COMPACTION_LEVEL},
@@ -144,7 +141,7 @@ pub fn make_meta(
         table_id: TableId::new(table_id),
         table_name: Arc::from(table_name),
         partition_id: PartitionId::new(partition_id),
-        partition_key: Arc::from(partition_key),
+        partition_key: PartitionKey::from(partition_key),
         min_sequence_number: SequenceNumber::new(min_sequence_number),
         max_sequence_number: SequenceNumber::new(max_sequence_number),
         compaction_level,
@@ -708,7 +705,6 @@ pub fn make_ingester_data(two_partitions: bool, loc: DataLocation) -> IngesterDa
         object_store,
         catalog,
         sequencers,
-        Arc::new(DefaultPartitioner::default()),
         exec,
         backoff::BackoffConfig::default(),
     )
@@ -753,7 +749,6 @@ pub async fn make_ingester_data_with_tombstones(loc: DataLocation) -> IngesterDa
         object_store,
         catalog,
         sequencers,
-        Arc::new(DefaultPartitioner::default()),
         exec,
         backoff::BackoffConfig::default(),
     )
@@ -766,7 +761,7 @@ pub(crate) fn make_partitions(
     sequencer_id: SequencerId,
     table_id: TableId,
     table_name: &str,
-) -> BTreeMap<String, PartitionData> {
+) -> BTreeMap<PartitionKey, PartitionData> {
     // In-memory data includes these rows but split between 4 groups go into
     // different batches of parittion 1 or partittion 2  as requeted
     // let expected = vec![
@@ -812,7 +807,7 @@ pub(crate) fn make_partitions(
         );
         p2.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
-        partitions.insert(TEST_PARTITION_2.to_string(), p2);
+        partitions.insert(PartitionKey::from(TEST_PARTITION_2), p2);
     } else {
         // Group 4: in buffer of p1
         // Fill `buffer`
@@ -828,7 +823,7 @@ pub(crate) fn make_partitions(
         p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
     }
 
-    partitions.insert(TEST_PARTITION_1.to_string(), p1);
+    partitions.insert(PartitionKey::from(TEST_PARTITION_1), p1);
     partitions
 }
 
@@ -839,7 +834,7 @@ pub(crate) async fn make_one_partition_with_tombstones(
     sequencer_id: SequencerId,
     table_id: TableId,
     table_name: &str,
-) -> BTreeMap<String, PartitionData> {
+) -> BTreeMap<PartitionKey, PartitionData> {
     // In-memory data includes these rows but split between 4 groups go into
     // different batches of parittion 1 or partittion 2  as requeted
     // let expected = vec![
@@ -893,7 +888,7 @@ pub(crate) async fn make_one_partition_with_tombstones(
     p1.buffer_write(SequenceNumber::new(seq_num), mb).unwrap();
 
     let mut partitions = BTreeMap::new();
-    partitions.insert(TEST_PARTITION_1.to_string(), p1);
+    partitions.insert(PartitionKey::from(TEST_PARTITION_1), p1);
 
     partitions
 }

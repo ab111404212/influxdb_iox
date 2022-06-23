@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arrow = "15.0.0"
+arrow = "16.0.0"
 async-trait = "0.1.56"
 backoff = { path = "../backoff" }
 cache_system = { path = "../cache_system" }
@@ -29,14 +29,16 @@ read_buffer = { path = "../read_buffer" }
 service_common = { path = "../service_common" }
 service_grpc_schema = { path = "../service_grpc_schema" }
 schema = { path = "../schema" }
+sharder = { path = "../sharder" }
 snafu = "0.7"
 thiserror = "1.0"
 iox_time = { path = "../iox_time" }
-tokio = { version = "1.18", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.2" }
+tokio = { version = "1.19", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.3" }
 tonic = { version = "0.7" }
 trace = { path = "../trace" }
-uuid = { version = "0.8", features = ["v4"] }
+tracker = { path = "../tracker" }
+uuid = { version = "1", features = ["v4"] }
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]

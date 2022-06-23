@@ -1,7 +1,7 @@
 //! Encode/Decode for messages
 
 use crate::core::WriteBufferError;
-use data_types::{NonEmptyString, Sequence};
+use data_types::{NonEmptyString, PartitionKey, Sequence};
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
 use generated_types::{
     google::FromOptionalField,
@@ -193,9 +193,16 @@ pub fn decode(
                         ))
                     })?;
 
+                    let partition_key = if write.partition_key.is_empty() {
+                        None
+                    } else {
+                        Some(PartitionKey::from(write.partition_key))
+                    };
+
                     Ok(DmlOperation::Write(DmlWrite::new(
                         headers.namespace,
                         tables,
+                        partition_key,
                         meta,
                     )))
                 }

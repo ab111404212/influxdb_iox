@@ -13,11 +13,11 @@ use async_trait::async_trait;
 use data_types::{
     Column, ColumnType, KafkaPartition, KafkaTopic, KafkaTopicId, Namespace, NamespaceId,
     ParquetFile, ParquetFileId, ParquetFileParams, ParquetFileWithMetadata, Partition, PartitionId,
-    PartitionInfo, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Sequencer,
-    SequencerId, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId,
+    PartitionInfo, PartitionKey, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber,
+    Sequencer, SequencerId, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId,
 };
 use iox_time::{SystemProvider, TimeProvider};
-use observability_deps::tracing::{info, warn};
+use observability_deps::tracing::{debug, info, warn};
 use sqlx::{
     migrate::Migrator, postgres::PgPoolOptions, types::Uuid, Acquire, Executor, Postgres, Row,
 };
@@ -334,10 +334,10 @@ async fn new_raw_pool(
     let pool = PgPoolOptions::new()
         .min_connections(1)
         .max_connections(options.max_conns)
-        .connect_timeout(options.connect_timeout)
+        .acquire_timeout(options.connect_timeout)
         .idle_timeout(options.idle_timeout)
         .test_before_acquire(true)
-        .after_connect(move |c| {
+        .after_connect(move |c, _meta| {
             let app_name = app_name.to_owned();
             let schema_name = schema_name.to_owned();
             Box::pin(async move {
@@ -1090,16 +1090,19 @@ WHERE kafka_topic_id = $1
 impl PartitionRepo for PostgresTxn {
     async fn create_or_get(
         &mut self,
-        key: &str,
+        key: PartitionKey,
         sequencer_id: SequencerId,
         table_id: TableId,
     ) -> Result<Partition> {
+        // Note: since sort_key is now an array, we must explicitly insert '{}' which is an empty array
+        // rather than NULL which sqlx will throw `UnexpectedNullError` while is is doing `ColumnDecode`
+
         let v = sqlx::query_as::<_, Partition>(
             r#"
 INSERT INTO partition
-    ( partition_key, sequencer_id, table_id )
+    ( partition_key, sequencer_id, table_id, sort_key)
 VALUES
-    ( $1, $2, $3 )
+    ( $1, $2, $3, '{}')
 ON CONFLICT ON CONSTRAINT partition_key_unique
 DO UPDATE SET partition_key = partition.partition_key
 RETURNING *;
@@ -1220,7 +1223,7 @@ WHERE partition.id = $1;
     async fn update_sort_key(
         &mut self,
         partition_id: PartitionId,
-        sort_key: &str,
+        sort_key: &[&str],
     ) -> Result<Partition> {
         let rec = sqlx::query_as::<_, Partition>(
             r#"
@@ -1239,6 +1242,8 @@ RETURNING *;
             sqlx::Error::RowNotFound => Error::PartitionNotFound { id: partition_id },
             _ => Error::SqlxError { source: e },
         })?;
+
+        debug!(?partition_id, input_sort_key=?sort_key, partition_after_catalog_update=?partition, "Paritition after updating sort key");
 
         Ok(partition)
     }
@@ -1464,6 +1469,7 @@ impl ParquetFileRepo for PostgresTxn {
             row_count,
             compaction_level,
             created_at,
+            column_set,
         } = parquet_file_params;
 
         let rec = sqlx::query_as::<_, ParquetFile>(
@@ -1471,8 +1477,8 @@ impl ParquetFileRepo for PostgresTxn {
 INSERT INTO parquet_file (
     sequencer_id, table_id, partition_id, object_store_id, min_sequence_number,
     max_sequence_number, min_time, max_time, file_size_bytes, parquet_metadata,
-    row_count, compaction_level, created_at, namespace_id )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
+    row_count, compaction_level, created_at, namespace_id, column_set )
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 )
 RETURNING *;
         "#,
         )
@@ -1490,6 +1496,7 @@ RETURNING *;
         .bind(compaction_level) // $12
         .bind(created_at) // $13
         .bind(namespace_id) // $14
+        .bind(column_set) // $15
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| {
@@ -1529,7 +1536,7 @@ RETURNING *;
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE sequencer_id = $1
   AND max_sequence_number > $2
@@ -1555,7 +1562,7 @@ SELECT parquet_file.id, parquet_file.sequencer_id, parquet_file.namespace_id,
        parquet_file.table_id, parquet_file.partition_id, parquet_file.object_store_id,
        parquet_file.min_sequence_number, parquet_file.max_sequence_number, parquet_file.min_time,
        parquet_file.max_time, parquet_file.to_delete, parquet_file.file_size_bytes,
-       parquet_file.row_count, parquet_file.compaction_level, parquet_file.created_at
+       parquet_file.row_count, parquet_file.compaction_level, parquet_file.created_at, parquet_file.column_set
 FROM parquet_file
 INNER JOIN table_name on table_name.id = parquet_file.table_id
 WHERE table_name.namespace_id = $1
@@ -1575,7 +1582,7 @@ WHERE table_name.namespace_id = $1
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE table_id = $1 AND to_delete IS NULL;
              "#,
@@ -1627,7 +1634,7 @@ RETURNING *;
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE parquet_file.sequencer_id = $1
   AND parquet_file.compaction_level = 0
@@ -1653,7 +1660,7 @@ WHERE parquet_file.sequencer_id = $1
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE parquet_file.sequencer_id = $1
   AND parquet_file.table_id = $2
@@ -1684,7 +1691,7 @@ WHERE parquet_file.sequencer_id = $1
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE parquet_file.partition_id = $1
   AND parquet_file.to_delete IS NULL;
@@ -1813,7 +1820,7 @@ WHERE table_id = $1
             r#"
 SELECT id, sequencer_id, namespace_id, table_id, partition_id, object_store_id,
        min_sequence_number, max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at
+       row_count, compaction_level, created_at, column_set
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -1947,7 +1954,7 @@ mod tests {
     use super::*;
     use crate::create_or_get_default_records;
     use assert_matches::assert_matches;
-    use metric::{Attributes, Metric, U64Histogram};
+    use metric::{Attributes, DurationHistogram, Metric};
     use rand::Rng;
     use sqlx::migrate::MigrateDatabase;
     use std::{env, io::Write, ops::DerefMut, sync::Arc, time::Instant};
@@ -2002,13 +2009,13 @@ mod tests {
 
     fn assert_metric_hit(metrics: &metric::Registry, name: &'static str) {
         let histogram = metrics
-            .get_instrument::<Metric<U64Histogram>>("catalog_op_duration_ms")
+            .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
             .expect("failed to read metric")
             .get_observer(&Attributes::from(&[("op", name), ("result", "success")]))
             .expect("failed to get observer")
             .fetch();
 
-        let hit_count = histogram.buckets.iter().fold(0, |acc, v| acc + v.count);
+        let hit_count = histogram.sample_count();
         assert!(hit_count > 0, "metric did not record any calls");
     }
 
@@ -2240,9 +2247,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_partition_create_or_get_idempotent() {
-        // If running an integration test on your laptop, this requires that you have Postgres
-        // running and that you've done the sqlx migrations. See the README in this crate for
-        // info to set it up.
+        // If running an integration test on your laptop, this requires that you have Postgres running
+        //
+        // This is a command to run this test on your laptop
+        //    TEST_INTEGRATION=1 TEST_INFLUXDB_IOX_CATALOG_DSN=postgres:postgres://$USER@localhost/iox_shared RUST_BACKTRACE=1 cargo test --package iox_catalog --lib -- postgres::tests::test_partition_create_or_get_idempotent --exact --nocapture
+        //
+        // If you do not have Postgres's iox_shared db, here are commands to install Postgres (on mac) and create iox_shared db
+        //    brew install postgresql
+        //    initdb pg
+        //    createdb iox_shared
+
         maybe_skip_integration!();
 
         let postgres = setup_db().await;
@@ -2278,7 +2292,7 @@ mod tests {
             .repositories()
             .await
             .partitions()
-            .create_or_get(key, sequencer_id, table_id)
+            .create_or_get(key.into(), sequencer_id, table_id)
             .await
             .expect("should create OK");
 
@@ -2289,7 +2303,7 @@ mod tests {
             .repositories()
             .await
             .partitions()
-            .create_or_get(key, sequencer_id, table_id)
+            .create_or_get(key.into(), sequencer_id, table_id)
             .await
             .expect("idempotent write should succeed");
 
@@ -2349,7 +2363,7 @@ mod tests {
             .repositories()
             .await
             .partitions()
-            .create_or_get(key, sequencers[0].id, table_id)
+            .create_or_get(key.into(), sequencers[0].id, table_id)
             .await
             .expect("should create OK");
 
@@ -2359,7 +2373,7 @@ mod tests {
             .repositories()
             .await
             .partitions()
-            .create_or_get(key, sequencers[1].id, table_id)
+            .create_or_get(key.into(), sequencers[1].id, table_id)
             .await
             .expect("result should not be evaluated");
 

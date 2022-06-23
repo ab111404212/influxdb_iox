@@ -5,9 +5,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use data_types::{
-    Column, ColumnType, KafkaPartition, KafkaTopic, Namespace, ParquetFile, ParquetFileId,
-    ParquetFileParams, ParquetFileWithMetadata, Partition, PartitionId, QueryPool, SequenceNumber,
-    Sequencer, SequencerId, Table, TableId, Timestamp, Tombstone, TombstoneId,
+    Column, ColumnSet, ColumnType, KafkaPartition, KafkaTopic, Namespace, ParquetFile,
+    ParquetFileId, ParquetFileParams, ParquetFileWithMetadata, Partition, PartitionId, QueryPool,
+    SequenceNumber, Sequencer, SequencerId, Table, TableId, Timestamp, Tombstone, TombstoneId,
 };
 use datafusion::physical_plan::metrics::Count;
 use iox_catalog::{
@@ -18,10 +18,11 @@ use iox_query::{exec::Executor, provider::RecordBatchDeduplicator, util::arrow_s
 use iox_time::{MockProvider, Time, TimeProvider};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
 use object_store::{memory::InMemory, DynObjectStore};
-use parquet_file::{metadata::IoxMetadata, storage::ParquetStorage};
+use observability_deps::tracing::debug;
+use parquet_file::{chunk::DecodedParquetFile, metadata::IoxMetadata, storage::ParquetStorage};
 use schema::{
     selection::Selection,
-    sort::{adjust_sort_key_columns, SortKey, SortKeyBuilder},
+    sort::{adjust_sort_key_columns, compute_sort_key, SortKey},
     Schema,
 };
 use std::sync::Arc;
@@ -90,7 +91,26 @@ impl TestCatalog {
         Arc::clone(&self.exec)
     }
 
-    /// Create a namesapce in teh catalog
+    /// Create a sequencer in the catalog
+    pub async fn create_sequencer(self: &Arc<Self>, sequencer: i32) -> Arc<Sequencer> {
+        let mut repos = self.catalog.repositories().await;
+
+        let kafka_topic = repos
+            .kafka_topics()
+            .create_or_get("kafka_topic")
+            .await
+            .unwrap();
+        let kafka_partition = KafkaPartition::new(sequencer);
+        Arc::new(
+            repos
+                .sequencers()
+                .create_or_get(&kafka_topic, kafka_partition)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Create a namesapce in the catalog
     pub async fn create_namespace(self: &Arc<Self>, name: &str) -> Arc<TestNamespace> {
         let mut repos = self.catalog.repositories().await;
 
@@ -345,7 +365,7 @@ impl TestTableBoundSequencer {
 
         let partition = repos
             .partitions()
-            .create_or_get(key, self.sequencer.sequencer.id, self.table.table.id)
+            .create_or_get(key.into(), self.sequencer.sequencer.id, self.table.table.id)
             .await
             .unwrap();
 
@@ -358,17 +378,17 @@ impl TestTableBoundSequencer {
         })
     }
 
-    /// Creat a partition with a specifiyed sory key for the table
+    /// Creat a partition with a specified sort key for the table
     pub async fn create_partition_with_sort_key(
         self: &Arc<Self>,
         key: &str,
-        sort_key: &str,
+        sort_key: &[&str],
     ) -> Arc<TestPartition> {
         let mut repos = self.catalog.catalog.repositories().await;
 
         let partition = repos
             .partitions()
-            .create_or_get(key, self.sequencer.sequencer.id, self.table.table.id)
+            .create_or_get(key.into(), self.sequencer.sequencer.id, self.table.table.id)
             .await
             .unwrap();
 
@@ -431,24 +451,27 @@ pub struct TestPartition {
 
 impl TestPartition {
     /// Update sort key.
-    pub async fn update_sort_key(self: &Arc<Self>, sort_key: SortKey) -> Self {
+    pub async fn update_sort_key(self: &Arc<Self>, sort_key: SortKey) -> Arc<Self> {
         let partition = self
             .catalog
             .catalog
             .repositories()
             .await
             .partitions()
-            .update_sort_key(self.partition.id, &sort_key.to_columns())
+            .update_sort_key(
+                self.partition.id,
+                &sort_key.to_columns().collect::<Vec<_>>(),
+            )
             .await
             .unwrap();
 
-        Self {
+        Arc::new(Self {
             catalog: Arc::clone(&self.catalog),
             namespace: Arc::clone(&self.namespace),
             table: Arc::clone(&self.table),
             sequencer: Arc::clone(&self.sequencer),
             partition,
-        }
+        })
     }
 
     /// Create a parquet for the partition
@@ -539,12 +562,19 @@ impl TestPartition {
             table_id: self.table.table.id,
             table_name: self.table.table.name.clone().into(),
             partition_id: self.partition.id,
-            partition_key: self.partition.partition_key.clone().into(),
+            partition_key: self.partition.partition_key.clone(),
             min_sequence_number,
             max_sequence_number,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             sort_key: Some(sort_key.clone()),
         };
+        let column_set = ColumnSet::new(
+            record_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone()),
+        );
         let (parquet_metadata_bin, real_file_size_bytes) = create_parquet_file(
             ParquetStorage::new(Arc::clone(&self.catalog.object_store)),
             &metadata,
@@ -567,6 +597,7 @@ impl TestPartition {
             row_count: row_count as i64,
             created_at: Timestamp::new(creation_time),
             compaction_level: INITIAL_COMPACTION_LEVEL,
+            column_set,
         };
         let parquet_file = repos
             .parquet_files()
@@ -633,14 +664,13 @@ async fn update_catalog_sort_key_if_needed(
     // columns onto the end
     match partition.sort_key() {
         Some(catalog_sort_key) => {
-            let sort_key_string = sort_key.to_columns();
-            let new_sort_key: Vec<_> = sort_key_string.split(',').collect();
+            let new_sort_key = sort_key.to_columns().collect::<Vec<_>>();
             let (_metadata, update) = adjust_sort_key_columns(&catalog_sort_key, &new_sort_key);
             if let Some(new_sort_key) = update {
-                let new_columns = new_sort_key.to_columns();
-                dbg!(
+                let new_columns = new_sort_key.to_columns().collect::<Vec<_>>();
+                debug!(
                     "Updating sort key from {:?} to {:?}",
-                    catalog_sort_key.to_columns(),
+                    catalog_sort_key.to_columns().collect::<Vec<_>>(),
                     &new_columns,
                 );
                 partitions_catalog
@@ -650,8 +680,8 @@ async fn update_catalog_sort_key_if_needed(
             }
         }
         None => {
-            let new_columns = sort_key.to_columns();
-            dbg!("Updating sort key from None to {:?}", &new_columns,);
+            let new_columns = sort_key.to_columns().collect::<Vec<_>>();
+            debug!("Updating sort key from None to {:?}", &new_columns);
             partitions_catalog
                 .update_sort_key(partition_id, &new_columns)
                 .await
@@ -698,6 +728,11 @@ impl TestParquetFile {
     pub fn parquet_file_no_metadata(self) -> ParquetFile {
         self.parquet_file.split_off_metadata().0
     }
+
+    /// Get Parquet file schema.
+    pub fn schema(&self) -> Arc<Schema> {
+        DecodedParquetFile::new(self.parquet_file.clone()).schema()
+    }
 }
 
 /// A catalog test tombstone
@@ -731,15 +766,8 @@ pub fn now() -> Time {
 
 /// Sort arrow record batch into arrow record batch and sort key.
 fn sort_batch(record_batch: RecordBatch, schema: Schema) -> (RecordBatch, SortKey) {
-    // build dummy sort key
-    let mut sort_key_builder = SortKeyBuilder::new();
-    for field in schema.tags_iter() {
-        sort_key_builder = sort_key_builder.with_col(field.name().clone());
-    }
-    for field in schema.time_iter() {
-        sort_key_builder = sort_key_builder.with_col(field.name().clone());
-    }
-    let sort_key = sort_key_builder.build();
+    // calculate realistic sort key
+    let sort_key = compute_sort_key(&schema, std::iter::once(&record_batch));
 
     // set up sorting
     let mut sort_columns = Vec::with_capacity(record_batch.num_columns());

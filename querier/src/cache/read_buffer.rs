@@ -8,15 +8,16 @@ use cache_system::{
         resource_consumption::FunctionEstimator,
         shared::SharedBackend,
     },
-    driver::Cache,
+    cache::{driver::CacheDriver, metrics::CacheWithMetrics, Cache},
     loader::{metrics::MetricsLoader, FunctionLoader},
 };
-use data_types::ParquetFileId;
+use data_types::{ParquetFile, ParquetFileId};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use iox_time::TimeProvider;
-use parquet_file::{chunk::DecodedParquetFile, storage::ParquetStorage};
-use read_buffer::RBChunk;
+use parquet_file::{storage::ParquetStorage, ParquetFilePath};
+use read_buffer::{ChunkMetrics, RBChunk};
+use schema::Schema;
 use snafu::{ResultExt, Snafu};
 use std::{collections::HashMap, mem, sync::Arc};
 
@@ -24,15 +25,17 @@ const CACHE_ID: &str = "read_buffer";
 
 #[derive(Debug)]
 struct ExtraFetchInfo {
-    decoded_parquet_file: Arc<DecodedParquetFile>,
-    table_name: Arc<str>,
+    parquet_file: Arc<ParquetFile>,
+    schema: Arc<Schema>,
     store: ParquetStorage,
 }
+
+type CacheT = Box<dyn Cache<K = ParquetFileId, V = Arc<RBChunk>, Extra = ExtraFetchInfo>>;
 
 /// Cache for parquet file data decoded into read buffer chunks
 #[derive(Debug)]
 pub struct ReadBufferCache {
-    cache: Cache<ParquetFileId, Arc<RBChunk>, ExtraFetchInfo>,
+    cache: CacheT,
 
     /// Handle that allows clearing entries for existing cache entries
     _backend: SharedBackend<ParquetFileId, Arc<RBChunk>>,
@@ -43,26 +46,27 @@ impl ReadBufferCache {
     pub fn new(
         backoff_config: BackoffConfig,
         time_provider: Arc<dyn TimeProvider>,
-        metric_registry: &metric::Registry,
+        metric_registry: Arc<metric::Registry>,
         ram_pool: Arc<ResourcePool<RamSize>>,
     ) -> Self {
+        let metric_registry_captured = Arc::clone(&metric_registry);
         let loader = Box::new(FunctionLoader::new(
             move |_parquet_file_id, extra_fetch_info: ExtraFetchInfo| {
                 let backoff_config = backoff_config.clone();
+                let metric_registry = Arc::clone(&metric_registry_captured);
 
                 async move {
                     let rb_chunk = Backoff::new(&backoff_config)
                         .retry_all_errors("get read buffer chunk from parquet file", || {
-                            let decoded_parquet_file_for_load =
-                                Arc::clone(&extra_fetch_info.decoded_parquet_file);
-                            let table_name_for_load = Arc::clone(&extra_fetch_info.table_name);
+                            let schema_for_load = Arc::clone(&extra_fetch_info.schema);
                             let store_for_load = extra_fetch_info.store.clone();
 
                             async {
                                 load_from_parquet_file(
-                                    decoded_parquet_file_for_load,
-                                    table_name_for_load,
+                                    &extra_fetch_info.parquet_file,
+                                    schema_for_load,
                                     store_for_load,
+                                    &metric_registry,
                                 )
                                 .await
                             }
@@ -79,7 +83,7 @@ impl ReadBufferCache {
             loader,
             CACHE_ID,
             Arc::clone(&time_provider),
-            metric_registry,
+            &metric_registry,
         ));
 
         // add to memory pool
@@ -97,7 +101,13 @@ impl ReadBufferCache {
         // get a direct handle so we can clear out entries as needed
         let _backend = SharedBackend::new(backend);
 
-        let cache = Cache::new(loader, Box::new(_backend.clone()));
+        let cache = Box::new(CacheDriver::new(loader, Box::new(_backend.clone())));
+        let cache = Box::new(CacheWithMetrics::new(
+            cache,
+            CACHE_ID,
+            time_provider,
+            &metric_registry,
+        ));
 
         Self { cache, _backend }
     }
@@ -105,16 +115,16 @@ impl ReadBufferCache {
     /// Get read buffer chunks from the cache or the Parquet file
     pub async fn get(
         &self,
-        decoded_parquet_file: Arc<DecodedParquetFile>,
-        table_name: Arc<str>,
+        parquet_file: Arc<ParquetFile>,
+        schema: Arc<Schema>,
         store: ParquetStorage,
     ) -> Arc<RBChunk> {
         self.cache
             .get(
-                decoded_parquet_file.parquet_file_id(),
+                parquet_file.id,
                 ExtraFetchInfo {
-                    decoded_parquet_file,
-                    table_name,
+                    parquet_file,
+                    schema,
                     store,
                 },
             )
@@ -134,25 +144,25 @@ enum LoadError {
 }
 
 async fn load_from_parquet_file(
-    decoded_parquet_file: Arc<DecodedParquetFile>,
-    table_name: Arc<str>,
+    parquet_file: &ParquetFile,
+    schema: Arc<Schema>,
     store: ParquetStorage,
+    metric_registry: &metric::Registry,
 ) -> Result<RBChunk, LoadError> {
     let record_batch_stream =
-        record_batches_stream(decoded_parquet_file, store).context(ReadingFromStorageSnafu)?;
-    read_buffer_chunk_from_stream(table_name, record_batch_stream)
+        record_batches_stream(parquet_file, schema, store).context(ReadingFromStorageSnafu)?;
+    read_buffer_chunk_from_stream(record_batch_stream, metric_registry)
         .await
         .context(BuildingChunkSnafu)
 }
 
 fn record_batches_stream(
-    decoded_parquet_file: Arc<DecodedParquetFile>,
+    parquet_file: &ParquetFile,
+    schema: Arc<Schema>,
     store: ParquetStorage,
 ) -> Result<SendableRecordBatchStream, parquet_file::storage::ReadError> {
-    let schema = decoded_parquet_file.schema().as_arrow();
-    let iox_metadata = &decoded_parquet_file.iox_metadata;
-
-    store.read_all(schema, iox_metadata)
+    let path: ParquetFilePath = parquet_file.into();
+    store.read_all(schema.as_arrow(), &path)
 }
 
 #[derive(Debug, Snafu)]
@@ -168,12 +178,15 @@ enum RBChunkError {
 }
 
 async fn read_buffer_chunk_from_stream(
-    table_name: Arc<str>,
     mut stream: SendableRecordBatchStream,
+    metric_registry: &metric::Registry,
 ) -> Result<RBChunk, RBChunkError> {
     let schema = stream.schema();
 
-    let mut builder = read_buffer::RBChunkBuilder::new(table_name.as_ref(), schema);
+    // create "global" metric object, so that we don't blow up prometheus w/ too many metrics
+    let metrics = ChunkMetrics::new(metric_registry, "iox_shared");
+
+    let mut builder = read_buffer::RBChunkBuilder::new(schema).with_metrics(metrics);
 
     while let Some(record_batch) = stream.next().await {
         builder
@@ -192,7 +205,7 @@ mod tests {
     use arrow_util::assert_batches_eq;
     use datafusion_util::stream_from_batches;
     use iox_tests::util::{TestCatalog, TestPartition};
-    use metric::{Attributes, Metric, U64Counter};
+    use metric::{Attributes, CumulativeGauge, Metric, U64Counter};
     use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
     use read_buffer::Predicate;
     use schema::selection::Selection;
@@ -202,7 +215,7 @@ mod tests {
         ReadBufferCache::new(
             BackoffConfig::default(),
             catalog.time_provider(),
-            &catalog.metric_registry(),
+            catalog.metric_registry(),
             test_ram_pool(),
         )
     }
@@ -227,14 +240,18 @@ mod tests {
         let (catalog, partition) = make_catalog().await;
 
         let test_parquet_file = partition.create_parquet_file("table1 foo=1 11").await;
-        let parquet_file = test_parquet_file.parquet_file;
-        let decoded = Arc::new(DecodedParquetFile::new(parquet_file));
+        let schema = test_parquet_file.schema();
+        let parquet_file = Arc::new(test_parquet_file.parquet_file_no_metadata());
         let storage = ParquetStorage::new(Arc::clone(&catalog.object_store));
 
         let cache = make_cache(&catalog);
 
         let rb = cache
-            .get(Arc::clone(&decoded), "table1".into(), storage.clone())
+            .get(
+                Arc::clone(&parquet_file),
+                Arc::clone(&schema),
+                storage.clone(),
+            )
             .await;
 
         let rb_batches: Vec<RecordBatch> = rb
@@ -253,14 +270,17 @@ mod tests {
         assert_batches_eq!(expected, &rb_batches);
 
         // This should fetch from the cache
-        let _rb_again = cache.get(decoded, "table1".into(), storage).await;
+        let _rb_again = cache.get(parquet_file, schema, storage).await;
 
         let m: Metric<U64Counter> = catalog
             .metric_registry
             .get_instrument("cache_load_function_calls")
             .unwrap();
         let v = m
-            .get_observer(&Attributes::from(&[("name", "read_buffer")]))
+            .get_observer(&Attributes::from(&[
+                ("name", "read_buffer"),
+                ("status", "new"),
+            ]))
             .unwrap()
             .fetch();
 
@@ -272,7 +292,8 @@ mod tests {
     async fn test_rb_chunks_lru() {
         let (catalog, _partition) = make_catalog().await;
 
-        let mut decoded_parquet_files = Vec::with_capacity(3);
+        let mut parquet_files = Vec::with_capacity(3);
+        let mut schemas = Vec::with_capacity(3);
         let ns = catalog.create_namespace("lru_ns").await;
 
         for i in 1..=3 {
@@ -288,8 +309,10 @@ mod tests {
             let test_parquet_file = partition
                 .create_parquet_file(&format!("{table_name} foo=1 11"))
                 .await;
-            let parquet_file = test_parquet_file.parquet_file;
-            decoded_parquet_files.push(Arc::new(DecodedParquetFile::new(parquet_file)));
+            let schema = test_parquet_file.schema();
+            let parquet_file = Arc::new(test_parquet_file.parquet_file_no_metadata());
+            parquet_files.push(parquet_file);
+            schemas.push(schema);
         }
 
         let storage = ParquetStorage::new(Arc::clone(&catalog.object_store));
@@ -304,15 +327,15 @@ mod tests {
         let cache = ReadBufferCache::new(
             BackoffConfig::default(),
             catalog.time_provider(),
-            &catalog.metric_registry(),
+            catalog.metric_registry(),
             ram_pool,
         );
 
         // load 1: Fetch table1 from storage
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[0]),
-                "cached_table1".into(),
+                Arc::clone(&parquet_files[0]),
+                Arc::clone(&schemas[0]),
                 storage.clone(),
             )
             .await;
@@ -321,8 +344,8 @@ mod tests {
         // load 2: Fetch table2 from storage
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[1]),
-                "cached_table2".into(),
+                Arc::clone(&parquet_files[1]),
+                Arc::clone(&schemas[1]),
                 storage.clone(),
             )
             .await;
@@ -331,8 +354,8 @@ mod tests {
         // Fetch table1 from cache, which should update its last used
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[0]),
-                "cached_table1".into(),
+                Arc::clone(&parquet_files[0]),
+                Arc::clone(&schemas[0]),
                 storage.clone(),
             )
             .await;
@@ -341,8 +364,8 @@ mod tests {
         // load 3: Fetch table3 from storage, which should evict table2
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[2]),
-                "cached_table3".into(),
+                Arc::clone(&parquet_files[2]),
+                Arc::clone(&schemas[2]),
                 storage.clone(),
             )
             .await;
@@ -351,8 +374,8 @@ mod tests {
         // load 4: Fetch table2, which will be from storage again, and will evict table1
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[1]),
-                "cached_table2".into(),
+                Arc::clone(&parquet_files[1]),
+                Arc::clone(&schemas[1]),
                 storage.clone(),
             )
             .await;
@@ -361,8 +384,8 @@ mod tests {
         // Fetch table2 from cache
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[1]),
-                "cached_table2".into(),
+                Arc::clone(&parquet_files[1]),
+                Arc::clone(&schemas[1]),
                 storage.clone(),
             )
             .await;
@@ -371,8 +394,8 @@ mod tests {
         // Fetch table3 from cache
         cache
             .get(
-                Arc::clone(&decoded_parquet_files[2]),
-                "cached_table3".into(),
+                Arc::clone(&parquet_files[2]),
+                Arc::clone(&schemas[2]),
                 storage.clone(),
             )
             .await;
@@ -381,13 +404,24 @@ mod tests {
             .metric_registry
             .get_instrument("cache_load_function_calls")
             .unwrap();
-        let v = m
-            .get_observer(&Attributes::from(&[("name", "read_buffer")]))
+        let v_new = m
+            .get_observer(&Attributes::from(&[
+                ("name", "read_buffer"),
+                ("status", "new"),
+            ]))
+            .unwrap()
+            .fetch();
+        let v_probably_reloaded = m
+            .get_observer(&Attributes::from(&[
+                ("name", "read_buffer"),
+                ("status", "probably_reloaded"),
+            ]))
             .unwrap()
             .fetch();
 
-        // Load is called 4x
-        assert_eq!(v, 4);
+        // Load is called 3x with new data and 1x for a chunk that we've loaded before
+        assert_eq!(v_new, 3);
+        assert_eq!(v_probably_reloaded, 1);
     }
 
     fn lp_to_record_batch(lp: &str) -> RecordBatch {
@@ -407,7 +441,9 @@ mod tests {
 
         let stream = stream_from_batches(batches);
 
-        let rb = read_buffer_chunk_from_stream("cpu".into(), stream)
+        let metric_registry = metric::Registry::new();
+
+        let rb = read_buffer_chunk_from_stream(stream, &metric_registry)
             .await
             .unwrap();
 
@@ -426,5 +462,31 @@ mod tests {
         ];
 
         assert_batches_eq!(expected, &rb_batches);
+    }
+
+    #[tokio::test]
+    async fn test_rb_metrics() {
+        let (catalog, partition) = make_catalog().await;
+
+        let test_parquet_file = partition.create_parquet_file("table1 foo=1 11").await;
+        let schema = test_parquet_file.schema();
+        let parquet_file = Arc::new(test_parquet_file.parquet_file_no_metadata());
+        let storage = ParquetStorage::new(Arc::clone(&catalog.object_store));
+
+        let cache = make_cache(&catalog);
+
+        let _rb = cache.get(parquet_file, schema, storage.clone()).await;
+
+        let g: Metric<CumulativeGauge> = catalog
+            .metric_registry
+            .get_instrument("read_buffer_row_group_total")
+            .unwrap();
+        let v = g
+            .get_observer(&Attributes::from(&[("db_name", "iox_shared")]))
+            .unwrap()
+            .fetch();
+
+        // Load is only called once
+        assert_eq!(v, 1);
     }
 }

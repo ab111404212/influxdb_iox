@@ -10,13 +10,10 @@ use crate::{
     },
 };
 
-use datafusion::{
-    logical_plan::{binary_expr, Operator},
-    prelude::*,
-};
+use datafusion::prelude::*;
 use iox_query::{frontend::influxrpc::InfluxRpcPlanner, Aggregate};
 use predicate::rpc_predicate::InfluxRpcPredicate;
-use predicate::PredicateBuilder;
+use predicate::Predicate;
 
 /// runs read_group(predicate) and compares it to the expected
 /// output
@@ -167,10 +164,9 @@ async fn test_read_group_data_no_tag_columns_min_with_delete_all() {
 
 #[tokio::test]
 async fn test_read_group_data_pred() {
-    let predicate = PredicateBuilder::default()
-        .add_expr(col("city").eq(lit("LA")))
-        .timestamp_range(190, 210)
-        .build();
+    let predicate = Predicate::default()
+        .with_expr(col("city").eq(lit("LA")))
+        .with_range(190, 210);
     let predicate = InfluxRpcPredicate::new(None, predicate);
     let agg = Aggregate::Sum;
     let group_columns = vec!["state"];
@@ -192,9 +188,7 @@ async fn test_read_group_data_pred() {
 #[tokio::test]
 async fn test_read_group_data_field_restriction() {
     // restrict to only the temp column
-    let predicate = PredicateBuilder::default()
-        .field_columns(vec!["temp"])
-        .build();
+    let predicate = Predicate::default().with_field_columns(vec!["temp"]);
     let predicate = InfluxRpcPredicate::new(None, predicate);
     let agg = Aggregate::Sum;
     let group_columns = vec!["state"];
@@ -217,16 +211,15 @@ async fn test_read_group_data_field_restriction() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_sum() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
-        .add_expr(
+        .with_expr(
             col("city")
                 .eq(lit("Boston"))
                 .or(col("city").eq(lit("Cambridge"))),
         )
         // fiter out first Cambridge row
-        .timestamp_range(100, 1000)
-        .build();
+        .with_range(100, 1000);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Sum;
@@ -252,16 +245,15 @@ async fn test_grouped_series_set_plan_sum() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_count() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
-        .add_expr(
+        .with_expr(
             col("city")
                 .eq(lit("Boston"))
                 .or(col("city").eq(lit("Cambridge"))),
         )
         // fiter out first Cambridge row
-        .timestamp_range(100, 1000)
-        .build();
+        .with_range(100, 1000);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Count;
@@ -287,16 +279,15 @@ async fn test_grouped_series_set_plan_count() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_mean() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // city=Boston OR city=Cambridge (filters out LA rows)
-        .add_expr(
+        .with_expr(
             col("city")
                 .eq(lit("Boston"))
                 .or(col("city").eq(lit("Cambridge"))),
         )
         // fiter out first Cambridge row
-        .timestamp_range(100, 1000)
-        .build();
+        .with_range(100, 1000);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Mean;
@@ -320,14 +311,13 @@ async fn test_grouped_series_set_plan_mean() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_count_measurement_pred() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // city = 'Boston' OR (_measurement = o2)
-        .add_expr(
+        .with_expr(
             col("city")
                 .eq(lit("Boston"))
                 .or(col("_measurement").eq(lit("o2"))),
-        )
-        .build();
+        );
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Count;
@@ -352,10 +342,9 @@ async fn test_grouped_series_set_plan_count_measurement_pred() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_first() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // fiter out first row (ts 1000)
-        .timestamp_range(1001, 4001)
-        .build();
+        .with_range(1001, 4001);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::First;
@@ -381,14 +370,13 @@ async fn test_grouped_series_set_plan_first() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_first_with_nulls() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // return three rows, but one series
         // "h2o,state=MA,city=Boston temp=70.4 50",
         // "h2o,state=MA,city=Boston other_temp=70.4 250",
         // "h2o,state=MA,city=Boston temp=70.4,moisture=43.0 100000"
-        .add_expr(col("state").eq(lit("MA")))
-        .add_expr(col("city").eq(lit("Boston")))
-        .build();
+        .with_expr(col("state").eq(lit("MA")))
+        .with_expr(col("city").eq(lit("Boston")));
     let predicate = InfluxRpcPredicate::new_table("h2o", predicate);
 
     let agg = Aggregate::First;
@@ -414,10 +402,9 @@ async fn test_grouped_series_set_plan_first_with_nulls() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_last() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // fiter out last row (ts 4000)
-        .timestamp_range(100, 3999)
-        .build();
+        .with_range(100, 3999);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Last;
@@ -443,14 +430,13 @@ async fn test_grouped_series_set_plan_last() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_last_with_nulls() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // return two three:
         // "h2o,state=MA,city=Boston temp=70.4 50",
         // "h2o,state=MA,city=Boston other_temp=70.4 250",
         // "h2o,state=MA,city=Boston temp=70.4,moisture=43.0 100000"
-        .add_expr(col("state").eq(lit("MA")))
-        .add_expr(col("city").eq(lit("Boston")))
-        .build();
+        .with_expr(col("state").eq(lit("MA")))
+        .with_expr(col("city").eq(lit("Boston")));
     let predicate = InfluxRpcPredicate::new_table("h2o", predicate);
 
     let agg = Aggregate::Last;
@@ -476,10 +462,9 @@ async fn test_grouped_series_set_plan_last_with_nulls() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_min() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // fiter out last row (ts 4000)
-        .timestamp_range(100, 3999)
-        .build();
+        .with_range(100, 3999);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Min;
@@ -505,10 +490,9 @@ async fn test_grouped_series_set_plan_min() {
 
 #[tokio::test]
 async fn test_grouped_series_set_plan_max() {
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // fiter out first row (ts 1000)
-        .timestamp_range(1001, 4001)
-        .build();
+        .with_range(1001, 4001);
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
     let agg = Aggregate::Max;
@@ -814,9 +798,7 @@ async fn test_grouped_series_set_plan_group_field_pred_and_null_fields() {
 #[tokio::test]
 async fn test_grouped_series_set_plan_group_field_pred_filter_on_field() {
     // no predicate
-    let predicate = PredicateBuilder::default()
-        .add_expr(col("_field").eq(lit("reading")))
-        .build();
+    let predicate = Predicate::default().with_expr(col("_field").eq(lit("reading")));
     let predicate = InfluxRpcPredicate::new_table("o2", predicate);
 
     let agg = Aggregate::Count;
@@ -847,11 +829,10 @@ async fn test_grouped_series_set_plan_group_field_pred_filter_on_field() {
 #[tokio::test]
 async fn test_grouped_series_set_plan_group_field_pred_filter_on_value() {
     // no predicate
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // 2018-05-22T19:53:26Z, stop: 2018-05-24T00:00:00Z
-        .timestamp_range(1527018806000000000, 1527120000000000000)
-        .add_expr(col("_value").eq(lit(1.77)))
-        .build();
+        .with_range(1527018806000000000, 1527120000000000000)
+        .with_expr(col("_value").eq(lit(1.77)));
 
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
@@ -877,15 +858,10 @@ async fn test_grouped_series_set_plan_group_field_pred_filter_on_value() {
 #[tokio::test]
 async fn test_grouped_series_set_plan_group_field_pred_filter_on_multiple_value() {
     // no predicate
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // 2018-05-22T19:53:26Z, stop: 2018-05-24T00:00:00Z
-        .timestamp_range(1527018806000000000, 1527120000000000000)
-        .add_expr(binary_expr(
-            col("_value").eq(lit(1.77)),
-            Operator::Or,
-            col("_value").eq(lit(1.72)),
-        ))
-        .build();
+        .with_range(1527018806000000000, 1527120000000000000)
+        .with_expr(col("_value").eq(lit(1.77)).or(col("_value").eq(lit(1.72))));
 
     let predicate = InfluxRpcPredicate::new(None, predicate);
 
@@ -913,11 +889,10 @@ async fn test_grouped_series_set_plan_group_field_pred_filter_on_multiple_value(
 #[tokio::test]
 async fn test_grouped_series_set_plan_group_field_pred_filter_on_value_sum() {
     // no predicate
-    let predicate = PredicateBuilder::default()
+    let predicate = Predicate::default()
         // 2018-05-22T19:53:26Z, stop: 2018-05-24T00:00:00Z
-        .timestamp_range(1527018806000000000, 1527120000000000000)
-        .add_expr(col("_value").eq(lit(1.77)))
-        .build();
+        .with_range(1527018806000000000, 1527120000000000000)
+        .with_expr(col("_value").eq(lit(1.77)));
 
     let predicate = InfluxRpcPredicate::new(None, predicate);
 

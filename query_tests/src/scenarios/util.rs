@@ -1,32 +1,28 @@
 //! This module contains util functions for testing scenarios
 use super::DbScenario;
-use arrow::record_batch::RecordBatch;
-use arrow_util::optimize::{optimize_record_batch, optimize_schema};
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use data_types::{
-    DeletePredicate, NonEmptyString, PartitionId, Sequence, SequenceNumber, SequencerId,
-    TombstoneId,
+    DeletePredicate, NonEmptyString, PartitionId, PartitionKey, Sequence, SequenceNumber,
+    SequencerId, TombstoneId,
 };
-use datafusion::physical_plan::RecordBatchStream;
-use datafusion_util::MemoryStream;
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use generated_types::{
     influxdata::iox::ingester::v1::{IngesterQueryResponseMetadata, PartitionStatus},
     ingester::IngesterQueryRequest,
 };
-use influxdb_iox_client::flight::Error as FlightError;
+use influxdb_iox_client::flight::{low_level::LowLevelMessage, Error as FlightError};
 use ingester::{
-    data::{IngesterData, IngesterQueryResponse, Persister, SequencerData},
+    data::{
+        FlatIngesterQueryResponse, IngesterData, IngesterQueryResponse, Persister, SequencerData,
+    },
     lifecycle::LifecycleHandle,
-    partioning::{Partitioner, PartitionerError},
     querier_handler::prepare_data_to_querier,
 };
 use iox_catalog::interface::get_schema_by_name;
 use iox_tests::util::{TestCatalog, TestNamespace, TestSequencer};
 use itertools::Itertools;
-use mutable_batch::MutableBatch;
 use mutable_batch_lp::LinesConverter;
 use parquet_file::storage::ParquetStorage;
 use querier::{
@@ -39,12 +35,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
     fmt::Write,
-    pin::Pin,
     sync::Arc,
-    sync::Mutex,
 };
 
-// Structs, enums, and functions used to exhaust all test scenarios of chunk life cycle
+// Structs, enums, and functions used to exhaust all test scenarios of chunk lifecycle
 // & when delete predicates are applied
 
 // STRUCTs & ENUMs
@@ -55,9 +49,9 @@ pub struct ChunkData<'a, 'b> {
 
     /// which stage this chunk will be created.
     ///
-    /// If not set, this chunk will be created in [all](ChunkStage::all) stages. This can be helpful when the test
-    /// scenario is not specific to the chunk stage. If this is used for multiple chunks, then all stage permutations
-    /// will be generated.
+    /// If not set, this chunk will be created in [all](ChunkStage::all) stages. This can be
+    /// helpful when the test scenario is not specific to the chunk stage. If this is used for
+    /// multiple chunks, then all stage permutations will be generated.
     pub chunk_stage: Option<ChunkStage>,
 
     /// Delete predicates
@@ -80,7 +74,8 @@ impl<'a, 'b> ChunkData<'a, 'b> {
         }
     }
 
-    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the linked [`ChunkStage`].
+    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the
+    /// linked [`ChunkStage`].
     fn replace_begin_and_end_delete_times(self) -> Self {
         Self {
             preds: self
@@ -100,7 +95,7 @@ impl<'a, 'b> ChunkData<'a, 'b> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChunkStage {
-    /// In parquet file.
+    /// In parquet file, persisted by the ingester. Now managed by the querier.
     Parquet,
 
     /// In ingester.
@@ -119,10 +114,12 @@ impl Display for ChunkStage {
 impl PartialOrd for ChunkStage {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
-            // allow multiple parquet chunks (for the same partition). sequence numbers will be used for ordering.
+            // allow multiple parquet chunks (for the same partition). sequence numbers will be
+            // used for ordering.
             (Self::Parquet, Self::Parquet) => Some(Ordering::Equal),
 
-            // "parquet" chunks are older (i.e. come earlier) than chunks that still life in the ingester
+            // "parquet" chunks are older (i.e. come earlier) than chunks that still life in the
+            // ingester
             (Self::Parquet, Self::Ingester) => Some(Ordering::Less),
             (Self::Ingester, Self::Parquet) => Some(Ordering::Greater),
 
@@ -149,7 +146,8 @@ pub struct Pred<'a> {
 }
 
 impl<'a> Pred<'a> {
-    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the linked [`ChunkStage`].
+    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the
+    /// linked [`ChunkStage`].
     fn replace_begin_and_end_delete_times(self, stage: ChunkStage) -> Self {
         Self {
             delete_time: self.delete_time.replace_begin_and_end_delete_times(stage),
@@ -168,9 +166,11 @@ impl<'a> Pred<'a> {
 /// Describes when a delete predicate was applied.
 ///
 /// # Ordering
-/// Compared to [`ChunkStage`], the ordering here may seem a bit confusing. While the latest payload / LP data
-/// resists in the ingester and is not yet available as a parquet file, the latest tombstones apply to parquet files and
-/// were (past tense!) NOT applied while the LP data was in the ingester.
+///
+/// Compared to [`ChunkStage`], the ordering here may seem a bit confusing. While the latest
+/// payload / LP data resists in the ingester and is not yet available as a parquet file, the
+/// latest tombstones apply to parquet files and were (past tense!) NOT applied while the LP data
+/// was in the ingester.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DeleteTime {
     /// Special delete time which marks the first time that could be used from deletion.
@@ -182,11 +182,13 @@ pub enum DeleteTime {
     Ingester {
         /// Flag if the tombstone also exists in the catalog.
         ///
-        /// If this is set to `false`, then the tombstone was applied by the ingester but does not exist in the catalog
-        /// any longer. This can be because:
+        /// If this is set to `false`, then the tombstone was applied by the ingester but does not
+        /// exist in the catalog any longer. This can be because:
         ///
-        /// - the ingester decided that it doesn't need to be added to the catalog (this is currently/2022-04-21 not implemented!)
-        /// - the compactor pruned the tombstone from the catalog because there are zero affected parquet files
+        /// - the ingester decided that it doesn't need to be added to the catalog (this is
+        ///   currently/2022-04-21 not implemented!)
+        /// - the compactor pruned the tombstone from the catalog because there are zero affected
+        ///   parquet files
         also_in_catalog: bool,
     },
 
@@ -223,7 +225,8 @@ impl DeleteTime {
         }
     }
 
-    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the linked [`ChunkStage`].
+    /// Replace [`DeleteTime::Begin`] and [`DeleteTime::End`] with values that correspond to the
+    /// linked [`ChunkStage`].
     fn replace_begin_and_end_delete_times(self, stage: ChunkStage) -> Self {
         match self {
             Self::Begin => Self::begin_for(stage),
@@ -266,14 +269,14 @@ impl Display for DeleteTime {
 
 // --------------------------------------------------------------------------------------------
 
-/// All scenarios chunk stages and their life cycle moves for given set of delete predicates.
+/// All scenarios of chunk stages and their lifecycle moves for a given set of delete predicates.
 /// If the delete predicates are empty, all scenarios of different chunk stages will be returned.
 pub async fn all_scenarios_for_one_chunk(
-    // These delete predicates are applied at all stages of the chunk life cycle
+    // These delete predicates are applied at all stages of the chunk lifecycle
     chunk_stage_preds: Vec<&DeletePredicate>,
     // These delete predicates are applied to all chunks at their final stages
     at_end_preds: Vec<&DeletePredicate>,
-    // Input data, formatted as line protocol.  One chunk will be created for each measurement
+    // Input data, formatted as line protocol. One chunk will be created for each measurement
     // (table) that appears in the input
     lp_lines: Vec<&str>,
     // Table to which the delete predicates will be applied
@@ -284,10 +287,9 @@ pub async fn all_scenarios_for_one_chunk(
     let mut scenarios = vec![];
     // Go over chunk stages
     for chunk_stage in ChunkStage::all() {
-        // Apply delete chunk_stage_preds to this chunk stage at
-        // all stages at and before that in the life cycle to the chunk
-        // But only need to get all delete times if chunk_stage_preds is not empty,
-        // otherwise, produce only one scenario of each chunk stage
+        // Apply delete chunk_stage_preds to this chunk stage at all stages at and before that in
+        // the lifecycle of the chunk. But we only need to get all delete times if
+        // chunk_stage_preds is not empty, otherwise, produce only one scenario of each chunk stage
         let mut delete_times = vec![DeleteTime::begin_for(chunk_stage)];
         if !chunk_stage_preds.is_empty() {
             delete_times = DeleteTime::all_from_and_before(chunk_stage)
@@ -325,9 +327,9 @@ pub async fn all_scenarios_for_one_chunk(
     scenarios
 }
 
-/// Build a chunk that may move with life cycle before/after deletes
-/// Note that the only chunk in this function can be moved to different stages and delete predicates
-/// can be applied at different stages when the chunk is moved.
+/// Build a chunk that may move with lifecycle before/after deletes. Note that the only chunk in
+/// this function can be moved to different stages, and delete predicates can be applied at
+/// different stages when the chunk is moved.
 async fn make_chunk_with_deletes_at_different_stages(
     lp_lines: Vec<&str>,
     chunk_stage: ChunkStage,
@@ -350,12 +352,7 @@ async fn make_chunk_with_deletes_at_different_stages(
     DbScenario { scenario_name, db }
 }
 
-/// This function loads two chunks of lp data into 4 different scenarios
-///
-/// Data in single open mutable buffer chunk
-/// Data in one open mutable buffer chunk, one closed mutable chunk
-/// Data in one open mutable buffer chunk, one read buffer chunk
-/// Data in one two read buffer chunks,
+/// Load two chunks of lp data into different chunk scenarios.
 pub async fn make_two_chunk_scenarios(
     partition_key: &str,
     data1: &str,
@@ -480,7 +477,10 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                             panic!("Cannot have delete time '{other}' for ingester chunk")
                         }
                         DeleteTime::Begin | DeleteTime::End => {
-                            unreachable!("Begin/end cases should have been replaced with concrete instances at this point")
+                            unreachable!(
+                                "Begin/end cases should have been replaced \
+                                 with concrete instances at this point"
+                            )
                         }
                     }
                 }
@@ -507,7 +507,8 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                                 .await;
                             mock_ingester.buffer_operation(op).await;
 
-                            // tombstones are created immediately, need to remember their ID to handle deletion later
+                            // tombstones are created immediately, need to remember their ID to
+                            // handle deletion later
                             let mut tombstone_id = None;
                             for id in mock_ingester.tombstone_ids(delete_table_name).await {
                                 if !ids_pre.contains(&id) {
@@ -521,7 +522,10 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                             // will be attached AFTER the chunk was created
                         }
                         DeleteTime::Begin | DeleteTime::End => {
-                            unreachable!("Begin/end cases should have been replaced with concrete instances at this point")
+                            unreachable!(
+                                "Begin/end cases should have been replaced \
+                                 with concrete instances at this point"
+                            )
                         }
                     }
                 }
@@ -568,7 +572,10 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
                             mock_ingester.buffer_operation(op).await;
                         }
                         DeleteTime::Begin | DeleteTime::End => {
-                            unreachable!("Begin/end cases should have been replaced with concrete instances at this point")
+                            unreachable!(
+                                "Begin/end cases should have been replaced \
+                                 with concrete instances at this point"
+                            )
                         }
                     }
                 }
@@ -600,8 +607,8 @@ async fn make_chunk(mock_ingester: &mut MockIngester, chunk: ChunkData<'_, '_>) 
 
 /// Ingester that can be controlled specifically for query tests.
 ///
-/// This uses as much ingester code as possible but allows more direct control over aspects like lifecycle and
-/// partioning.
+/// This uses as much ingester code as possible but allows more direct control over aspects like
+/// lifecycle and partioning.
 #[derive(Debug)]
 struct MockIngester {
     /// Test catalog state.
@@ -613,14 +620,12 @@ struct MockIngester {
     /// Sequencer used for testing.
     sequencer: Arc<TestSequencer>,
 
-    /// Special partitioner that lets us control to which partition we write.
-    partitioner: Arc<ConstantPartitioner>,
-
     /// Memory of partition keys for certain sequence numbers.
     ///
-    /// This is currently required because [`DmlWrite`] does not carry partiion information so we need to do that. In
-    /// production this is not required because the router and the ingester use the same partition logic, but we need
-    /// direct control over the partion key for the query tests.
+    /// This is currently required because [`DmlWrite`] does not carry partiion information so we
+    /// need to do that. In production this is not required because the router and the ingester use
+    /// the same partition logic, but we need direct control over the partion key for the query
+    /// tests.
     partition_keys: HashMap<SequenceNumber, String>,
 
     /// Ingester state.
@@ -629,7 +634,7 @@ struct MockIngester {
     /// Next sequence number.
     ///
     /// This is kinda a poor-mans write buffer.
-    sequence_counter: u64,
+    sequence_counter: i64,
 }
 
 impl MockIngester {
@@ -646,12 +651,10 @@ impl MockIngester {
                 catalog.metric_registry(),
             ),
         )]);
-        let partitioner = Arc::new(ConstantPartitioner::default());
         let ingester_data = Arc::new(IngesterData::new(
             catalog.object_store(),
             catalog.catalog(),
             sequencers,
-            Arc::clone(&partitioner) as _,
             catalog.exec(),
             BackoffConfig::default(),
         ));
@@ -660,7 +663,6 @@ impl MockIngester {
             catalog,
             ns,
             sequencer,
-            partitioner,
             partition_keys: Default::default(),
             ingester_data,
             sequence_counter: 0,
@@ -671,18 +673,10 @@ impl MockIngester {
     ///
     /// This will never persist.
     ///
-    /// Takes `&self mut` because our partioning implementation does not work with concurrent access.
+    /// Takes `&self mut` because our partioning implementation does not work with concurrent
+    /// access.
     async fn buffer_operation(&mut self, dml_operation: DmlOperation) {
         let lifecycle_handle = NoopLifecycleHandle {};
-
-        // set up partitioner for writes
-        if matches!(dml_operation, DmlOperation::Write(_)) {
-            let sequence_number = SequenceNumber::new(
-                dml_operation.meta().sequence().unwrap().sequence_number as i64,
-            );
-            self.partitioner
-                .set(self.partition_keys.get(&sequence_number).unwrap().clone());
-        }
 
         let should_pause = self
             .ingester_data
@@ -704,10 +698,10 @@ impl MockIngester {
     }
 
     /// Draws new sequence number.
-    fn next_sequence_number(&mut self) -> u64 {
+    fn next_sequence_number(&mut self) -> SequenceNumber {
         let next = self.sequence_counter;
         self.sequence_counter += 1;
-        next
+        SequenceNumber::new(next)
     }
 
     /// Simulate what the router would do when it encounters the given set of line protocol lines.
@@ -760,10 +754,8 @@ impl MockIngester {
         }
 
         let sequence_number = self.next_sequence_number();
-        self.partition_keys.insert(
-            SequenceNumber::new(sequence_number as i64),
-            partition_key.to_string(),
-        );
+        self.partition_keys
+            .insert(sequence_number, partition_key.to_string());
         let meta = DmlMeta::sequenced(
             Sequence::new(self.sequencer.sequencer.id.get() as u32, sequence_number),
             self.catalog.time_provider().now(),
@@ -773,6 +765,7 @@ impl MockIngester {
         let op = DmlOperation::Write(DmlWrite::new(
             self.ns.namespace.name.clone(),
             mutable_batches,
+            Some(PartitionKey::from(partition_key)),
             meta,
         ));
         (op, partition_ids)
@@ -828,7 +821,8 @@ impl MockIngester {
 
     /// Finalizes the ingester and creates a querier namespace that can be used for query tests.
     ///
-    /// The querier namespace will hold a simulated connection to the ingester to be able to query unpersisted data.
+    /// The querier namespace will hold a simulated connection to the ingester to be able to query
+    /// unpersisted data.
     async fn into_query_namespace(self) -> Arc<QuerierNamespace> {
         let mut repos = self.catalog.catalog.repositories().await;
         let schema = Arc::new(
@@ -886,25 +880,6 @@ impl LifecycleHandle for NoopLifecycleHandle {
     }
 }
 
-/// Special partitioner that returns a constant values.
-#[derive(Debug, Default)]
-struct ConstantPartitioner {
-    partition_key: Mutex<String>,
-}
-
-impl ConstantPartitioner {
-    /// Set partition key.
-    fn set(&self, partition_key: String) {
-        *self.partition_key.lock().unwrap() = partition_key;
-    }
-}
-
-impl Partitioner for ConstantPartitioner {
-    fn partition_key(&self, _batch: &MutableBatch) -> Result<String, PartitionerError> {
-        Ok(self.partition_key.lock().unwrap().clone())
-    }
-}
-
 #[async_trait]
 impl IngesterFlightClient for MockIngester {
     async fn query(
@@ -912,8 +887,9 @@ impl IngesterFlightClient for MockIngester {
         _ingester_address: Arc<str>,
         request: IngesterQueryRequest,
     ) -> Result<Box<dyn IngesterFlightClientQueryData>, IngesterFlightClientError> {
-        // NOTE: we MUST NOT unwrap errors here because some query tests assert error behavior (e.g. passing predicates
-        // of wrong types)
+        // NOTE: we MUST NOT unwrap errors here because some query tests assert error behavior
+        // (e.g. passing predicates of wrong types)
+        let request = Arc::new(request);
         let response = prepare_data_to_querier(&self.ingester_data, &request)
             .await
             .map_err(|e| IngesterFlightClientError::Flight {
@@ -922,83 +898,81 @@ impl IngesterFlightClient for MockIngester {
                 ))),
             })?;
 
-        // perform the same optimizations that the ingester would use
-        let schema = Arc::new(optimize_schema(&response.schema.as_arrow()));
-        let batches: Vec<RecordBatch> = response
-            .data
-            .map_ok(|batch| optimize_record_batch(&batch, Arc::clone(&schema)).unwrap())
-            .try_collect()
-            .await
-            .unwrap();
-        let data = Box::pin(MemoryStream::new_with_schema(batches, Arc::clone(&schema)))
-            as Pin<Box<dyn RecordBatchStream + Send>>;
-        let schema = Arc::new(schema::Schema::try_from(schema).unwrap());
-        let response = IngesterQueryResponse {
-            data,
-            schema,
-            ..response
-        };
-
-        Ok(Box::new(QueryDataAdapter::new(response)))
+        Ok(Box::new(QueryDataAdapter::new(response).await))
     }
 }
 
-/// Helper struct to present [`IngesterQueryResponse`] (produces by the ingester) as a [`IngesterFlightClientQueryData`]
-/// (used by the querier) without doing any real gRPC IO.
-#[derive(Debug)]
+/// Helper struct to present [`IngesterQueryResponse`] (produces by the ingester) as a
+/// [`IngesterFlightClientQueryData`] (used by the querier) without doing any real gRPC IO.
 struct QueryDataAdapter {
-    response: IngesterQueryResponse,
-    app_metadata: IngesterQueryResponseMetadata,
+    messages: Box<
+        dyn Iterator<Item = Result<(LowLevelMessage, IngesterQueryResponseMetadata), FlightError>>
+            + Send,
+    >,
+}
+
+impl std::fmt::Debug for QueryDataAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryDataAdapter").finish_non_exhaustive()
+    }
 }
 
 impl QueryDataAdapter {
     /// Create new adapter.
     ///
     /// This pre-calculates some data structure that we are going to need later.
-    fn new(response: IngesterQueryResponse) -> Self {
-        let app_metadata = IngesterQueryResponseMetadata {
-            unpersisted_partitions: response
-                .unpersisted_partitions
-                .iter()
-                .map(|(id, status)| {
-                    (
-                        id.get(),
-                        PartitionStatus {
-                            parquet_max_sequence_number: status
-                                .parquet_max_sequence_number
-                                .map(|x| x.get()),
-                            tombstone_max_sequence_number: status
-                                .tombstone_max_sequence_number
-                                .map(|x| x.get()),
-                        },
-                    )
-                })
-                .collect(),
-            batch_partition_ids: response
-                .batch_partition_ids
-                .iter()
-                .map(|id| id.get())
-                .collect(),
-        };
+    async fn new(response: IngesterQueryResponse) -> Self {
+        let mut messages = vec![];
+        let mut stream = response.flatten();
+        while let Some(msg_res) = stream.next().await {
+            match msg_res {
+                Ok(msg) => {
+                    let (msg, md) = match msg {
+                        FlatIngesterQueryResponse::StartPartition {
+                            partition_id,
+                            status,
+                        } => (
+                            LowLevelMessage::None,
+                            IngesterQueryResponseMetadata {
+                                partition_id: partition_id.get(),
+                                status: Some(PartitionStatus {
+                                    parquet_max_sequence_number: status
+                                        .parquet_max_sequence_number
+                                        .map(|x| x.get()),
+                                    tombstone_max_sequence_number: status
+                                        .tombstone_max_sequence_number
+                                        .map(|x| x.get()),
+                                }),
+                            },
+                        ),
+                        FlatIngesterQueryResponse::StartSnapshot { schema } => (
+                            LowLevelMessage::Schema(schema),
+                            IngesterQueryResponseMetadata::default(),
+                        ),
+                        FlatIngesterQueryResponse::RecordBatch { batch } => (
+                            LowLevelMessage::RecordBatch(batch),
+                            IngesterQueryResponseMetadata::default(),
+                        ),
+                    };
+                    messages.push(Ok((msg, md)));
+                }
+                Err(e) => {
+                    messages.push(Err(FlightError::ArrowError(e)));
+                }
+            }
+        }
 
         Self {
-            response,
-            app_metadata,
+            messages: Box::new(messages.into_iter()),
         }
     }
 }
 
 #[async_trait]
 impl IngesterFlightClientQueryData for QueryDataAdapter {
-    async fn next(&mut self) -> Result<Option<RecordBatch>, FlightError> {
-        Ok(self.response.data.next().await.map(|x| x.unwrap()))
-    }
-
-    fn app_metadata(&self) -> &IngesterQueryResponseMetadata {
-        &self.app_metadata
-    }
-
-    fn schema(&self) -> Arc<arrow::datatypes::Schema> {
-        self.response.schema.as_arrow()
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(LowLevelMessage, IngesterQueryResponseMetadata)>, FlightError> {
+        self.messages.next().transpose()
     }
 }

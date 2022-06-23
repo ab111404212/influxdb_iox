@@ -9,8 +9,8 @@
     clippy::clone_on_ref_ptr
 )]
 
-pub mod cache;
-pub mod chunk;
+mod cache;
+mod chunk;
 mod database;
 mod handler;
 mod ingester;
@@ -23,7 +23,7 @@ mod table;
 mod tombstone;
 
 pub use cache::CatalogCache as QuerierCatalogCache;
-pub use database::QuerierDatabase;
+pub use database::{Error as QuerierDatabaseError, QuerierDatabase};
 pub use handler::{QuerierHandler, QuerierHandlerImpl};
 pub use ingester::{
     create_ingester_connection, create_ingester_connection_for_testing,

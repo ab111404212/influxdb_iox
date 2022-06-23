@@ -158,8 +158,12 @@ impl QueryChunk for QueryableParquetChunk {
     // it is not safe to use it for sorting chunk
     fn id(&self) -> ChunkId {
         let timestamp_nano = self.min_time.get();
-        let timestamp_nano_u128 =
-            u128::try_from(timestamp_nano).expect("Cannot convert timestamp nano to u128 ");
+        let timestamp_nano_u128 = u128::try_from(timestamp_nano).unwrap_or_else(|_| {
+            panic!(
+                "Cannot convert timestamp nano to u128. Timestamp nano: {}, Paritition id: {}",
+                timestamp_nano, self.partition_id
+            )
+        });
 
         ChunkId::new_id(timestamp_nano_u128)
     }
@@ -253,9 +257,11 @@ impl QueryChunk for QueryableParquetChunk {
     // Order of the chunk so they can be deduplicate correctly
     fn order(&self) -> ChunkOrder {
         let seq_num = self.min_sequence_number.get();
-        let seq_num = u32::try_from(seq_num)
-            .expect("Sequence number should have been converted to chunk order successfully");
-        ChunkOrder::new(seq_num)
-            .expect("Sequence number should have been converted to chunk order successfully")
+        ChunkOrder::new(seq_num).unwrap_or_else(|| {
+            panic!(
+                "Error converting sequence number {} to ChunkOrder for partition {}",
+                seq_num, self.partition_id
+            );
+        })
     }
 }

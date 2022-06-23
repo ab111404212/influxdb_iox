@@ -1,21 +1,19 @@
 //! Data for the lifecycle of the Ingester
 
 use crate::{
-    compact::compact_persisting_batch,
-    lifecycle::LifecycleHandle,
-    partioning::{Partitioner, PartitionerError},
-    persist::persist,
-    querier_handler::query,
+    compact::compact_persisting_batch, lifecycle::LifecycleHandle, querier_handler::query,
 };
-use arrow::record_batch::RecordBatch;
+use arrow::{error::ArrowError, record_batch::RecordBatch};
+use arrow_util::optimize::{optimize_record_batch, optimize_schema};
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
 use data_types::{
-    DeletePredicate, KafkaPartition, NamespaceId, PartitionId, PartitionInfo, SequenceNumber,
-    SequencerId, TableId, Timestamp, Tombstone,
+    DeletePredicate, KafkaPartition, NamespaceId, PartitionId, PartitionInfo, PartitionKey,
+    SequenceNumber, SequencerId, TableId, Timestamp, Tombstone,
 };
 use datafusion::physical_plan::SendableRecordBatchStream;
 use dml::DmlOperation;
+use futures::{Stream, StreamExt};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
 use iox_time::SystemProvider;
@@ -26,39 +24,24 @@ use observability_deps::tracing::{debug, warn};
 use parking_lot::RwLock;
 use parquet_file::storage::ParquetStorage;
 use predicate::Predicate;
-use schema::{selection::Selection, Schema};
+use schema::selection::Selection;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    convert::TryFrom,
+    pin::Pin,
     sync::Arc,
 };
 use uuid::Uuid;
 use write_summary::SequencerProgress;
 
+mod triggers;
+use self::triggers::TestTriggers;
+
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
-    #[snafu(display("Error while reading Topic {}", name))]
-    ReadTopic {
-        source: iox_catalog::interface::Error,
-        name: String,
-    },
-
-    #[snafu(display("Error while reading Kafka Partition id {}", id.get()))]
-    ReadSequencer {
-        source: iox_catalog::interface::Error,
-        id: KafkaPartition,
-    },
-
     #[snafu(display("Sequencer {} not found in data map", sequencer_id))]
     SequencerNotFound { sequencer_id: SequencerId },
-
-    #[snafu(display(
-        "Sequencer not found for kafka partition {} in data map",
-        kafka_partition
-    ))]
-    SequencerForPartitionNotFound { kafka_partition: KafkaPartition },
 
     #[snafu(display("Namespace {} not found in catalog", namespace))]
     NamespaceNotFound { namespace: String },
@@ -74,29 +57,11 @@ pub enum Error {
         source: iox_catalog::interface::Error,
     },
 
-    #[snafu(display("The persisting is in progress. Cannot accept more persisting batch"))]
-    PersistingNotEmpty,
-
-    #[snafu(display("Nothing in the Persisting list to get removed"))]
-    PersistingEmpty,
-
-    #[snafu(display(
-        "The given batch does not match any in the Persisting list. \
-        Nothing is removed from the Persisting list"
-    ))]
-    PersistingNotMatch,
-
-    #[snafu(display("Cannot partition data: {}", source))]
-    Partitioning { source: PartitionerError },
-
     #[snafu(display("Snapshot error: {}", source))]
     Snapshot { source: mutable_batch::Error },
 
     #[snafu(display("Error while filtering columns from snapshot: {}", source))]
     FilterColumn { source: arrow::error::ArrowError },
-
-    #[snafu(display("Partition not found: {}", partition_id))]
-    PartitionNotFound { partition_id: PartitionId },
 
     #[snafu(display("Error while copying buffer to snapshot: {}", source))]
     BufferToSnapshot { source: mutable_batch::Error },
@@ -122,9 +87,6 @@ pub struct IngesterData {
     /// get ingested.
     sequencers: BTreeMap<SequencerId, SequencerData>,
 
-    /// Partitioner.
-    partitioner: Arc<dyn Partitioner>,
-
     /// Executor for running queries and compacting and persisting
     exec: Arc<Executor>,
 
@@ -138,7 +100,6 @@ impl IngesterData {
         object_store: Arc<DynObjectStore>,
         catalog: Arc<dyn Catalog>,
         sequencers: BTreeMap<SequencerId, SequencerData>,
-        partitioner: Arc<dyn Partitioner>,
         exec: Arc<Executor>,
         backoff_config: BackoffConfig,
     ) -> Self {
@@ -146,7 +107,6 @@ impl IngesterData {
             store: ParquetStorage::new(object_store),
             catalog,
             sequencers,
-            partitioner,
             exec,
             backoff_config,
         }
@@ -190,7 +150,6 @@ impl IngesterData {
                 sequencer_id,
                 self.catalog.as_ref(),
                 lifecycle_handle,
-                self.partitioner.as_ref(),
                 &self.exec,
             )
             .await
@@ -273,13 +232,13 @@ impl Persister for IngesterData {
                     partition_info.namespace_name, partition_info.partition.sequencer_id
                 )
             });
-        debug!(?partition_info, "Persisting");
+        debug!(?partition_id, ?partition_info, "Persisting");
 
         let persisting_batch = namespace.snapshot_to_persisting(&partition_info).await;
 
         if let Some(persisting_batch) = persisting_batch {
             // do the CPU intensive work of compaction, de-duplication and sorting
-            let (record_batches, iox_meta, sort_key_update) = match compact_persisting_batch(
+            let (record_stream, iox_meta, sort_key_update) = match compact_persisting_batch(
                 Arc::new(SystemProvider::new()),
                 &self.exec,
                 namespace.namespace_id.get(),
@@ -299,41 +258,51 @@ impl Persister for IngesterData {
                     return;
                 }
             };
+            debug!(
+                ?partition_id,
+                ?sort_key_update,
+                "Adjusted sort key during compacting the persting batch"
+            );
 
-            // save the compacted data to a parquet file in object storage
-            let file_size_and_md = Backoff::new(&self.backoff_config)
-                .retry_all_errors("persist to object store", || {
-                    persist(&iox_meta, record_batches.to_vec(), self.store.clone())
+            // Save the compacted data to a parquet file in object storage.
+            //
+            // This call retries until it completes.
+            let (md, file_size) = self
+                .store
+                .upload(record_stream, &iox_meta)
+                .await
+                .expect("unexpected fatal persist error");
+
+            // Add the parquet file to the catalog until succeed
+            let parquet_file = iox_meta.to_parquet_file(partition_id, file_size, &md);
+            Backoff::new(&self.backoff_config)
+                .retry_all_errors("add parquet file to catalog", || async {
+                    let mut repos = self.catalog.repositories().await;
+                    debug!(
+                        table_name=%iox_meta.table_name,
+                        "adding parquet file to catalog"
+                    );
+
+                    repos.parquet_files().create(parquet_file.clone()).await
                 })
                 .await
                 .expect("retry forever");
 
-            if let Some((file_size, md)) = file_size_and_md {
-                // Add the parquet file to the catalog until succeed
-                let parquet_file = iox_meta.to_parquet_file(partition_id, file_size, &md);
-                Backoff::new(&self.backoff_config)
-                    .retry_all_errors("add parquet file to catalog", || async {
-                        let mut repos = self.catalog.repositories().await;
-                        debug!(
-                            table_name=%iox_meta.table_name,
-                            "adding parquet file to catalog"
-                        );
-
-                        repos.parquet_files().create(parquet_file.clone()).await
-                    })
-                    .await
-                    .expect("retry forever");
-            }
-
             // Update the sort key in the catalog if there are additional columns
             if let Some(new_sort_key) = sort_key_update {
-                let sort_key_string = new_sort_key.to_columns();
+                let sort_key = new_sort_key.to_columns().collect::<Vec<_>>();
+                debug!(
+                    ?partition_id,
+                    ?sort_key,
+                    ?partition_id,
+                    "Adjusted sort key to be updated to the catalog"
+                );
                 Backoff::new(&self.backoff_config)
                     .retry_all_errors("update_sort_key", || async {
                         let mut repos = self.catalog.repositories().await;
                         repos
                             .partitions()
-                            .update_sort_key(partition_id, &sort_key_string)
+                            .update_sort_key(partition_id, &sort_key)
                             .await
                     })
                     .await
@@ -342,6 +311,7 @@ impl Persister for IngesterData {
 
             // and remove the persisted data from memory
             debug!(
+                ?partition_id,
                 table_name=%partition_info.table_name,
                 partition_key=%partition_info.partition.partition_key,
                 max_sequence_number=%iox_meta.max_sequence_number.get(),
@@ -431,7 +401,6 @@ impl SequencerData {
         sequencer_id: SequencerId,
         catalog: &dyn Catalog,
         lifecycle_handle: &dyn LifecycleHandle,
-        partitioner: &dyn Partitioner,
         executor: &Executor,
     ) -> Result<bool> {
         let namespace_data = match self.namespace(dml_operation.namespace()) {
@@ -448,7 +417,6 @@ impl SequencerData {
                 sequencer_id,
                 catalog,
                 lifecycle_handle,
-                partitioner,
                 executor,
             )
             .await
@@ -509,6 +477,50 @@ pub struct NamespaceData {
     tables: RwLock<BTreeMap<String, Arc<tokio::sync::RwLock<TableData>>>>,
 
     table_count: U64Counter,
+
+    /// The sequence number being actively written, if any.
+    ///
+    /// This is used to know when a sequence number is only partially
+    /// buffered for readability reporting. For example, in the
+    /// following diagram a write for SequenceNumber 10 is only
+    /// partially readable because it has been written into partitions
+    /// A and B but not yet C. The max buffered number on each
+    /// PartitionData is not sufficient to determine if the write is
+    /// complete.
+    ///
+    /// ```text
+    /// ╔═══════════════════════════════════════════════╗
+    /// ║                                               ║   DML Operation (write)
+    /// ║  ┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓  ║   SequenceNumber = 10
+    /// ║  ┃ Data for C  ┃ Data for B  ┃ Data for A  ┃  ║
+    /// ║  ┗━━━━━━━━━━━━━┻━━━━━━━━━━━━━┻━━━━━━━━━━━━━┛  ║
+    /// ║         │             │             │         ║
+    /// ╚═══════════════════════╬═════════════╬═════════╝
+    ///           │             │             │           ┌──────────────────────────────────┐
+    ///                         │             │           │           Partition A            │
+    ///           │             │             └──────────▶│        max buffered = 10         │
+    ///                         │                         └──────────────────────────────────┘
+    ///           │             │
+    ///                         │                         ┌──────────────────────────────────┐
+    ///           │             │                         │           Partition B            │
+    ///                         └────────────────────────▶│        max buffered = 10         │
+    ///           │                                       └──────────────────────────────────┘
+    ///
+    ///           │
+    ///                                                   ┌──────────────────────────────────┐
+    ///           │                                       │           Partition C            │
+    ///            ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▶│         max buffered = 7         │
+    ///                                                   └──────────────────────────────────┘
+    ///           Write is partially buffered. It has been
+    ///            written to Partitions A and B, but not
+    ///                  yet written to Partition C
+    ///                                                               PartitionData
+    ///                                                       (Ingester state per partition)
+    ///```
+    buffering_sequence_number: RwLock<Option<SequenceNumber>>,
+
+    /// Control the flow of ingest, for testing purposes
+    test_triggers: TestTriggers,
 }
 
 impl NamespaceData {
@@ -525,6 +537,8 @@ impl NamespaceData {
             namespace_id,
             tables: Default::default(),
             table_count,
+            buffering_sequence_number: RwLock::new(None),
+            test_triggers: TestTriggers::new(),
         }
     }
 
@@ -538,6 +552,8 @@ impl NamespaceData {
             namespace_id,
             tables: RwLock::new(tables),
             table_count: Default::default(),
+            buffering_sequence_number: RwLock::new(None),
+            test_triggers: TestTriggers::new(),
         }
     }
 
@@ -550,7 +566,6 @@ impl NamespaceData {
         sequencer_id: SequencerId,
         catalog: &dyn Catalog,
         lifecycle_handle: &dyn LifecycleHandle,
-        partitioner: &dyn Partitioner,
         executor: &Executor,
     ) -> Result<bool> {
         let sequence_number = dml_operation
@@ -558,12 +573,23 @@ impl NamespaceData {
             .sequence()
             .expect("must have sequence number")
             .sequence_number;
-        let sequence_number = i64::try_from(sequence_number).expect("sequence out of bounds");
-        let sequence_number = SequenceNumber::new(sequence_number);
+
+        // Note that this namespace is actively writing this sequence
+        // number. Since there is no namespace wide lock held during a
+        // write, this number is used to detect and update reported
+        // progress during a write
+        let _sequence_number_guard =
+            ScopedSequenceNumber::new(sequence_number, &self.buffering_sequence_number);
 
         match dml_operation {
             DmlOperation::Write(write) => {
                 let mut pause_writes = false;
+
+                // Extract the partition key derived by the router.
+                let partition_key = write
+                    .partition_key()
+                    .expect("no partition key in dml write")
+                    .clone();
 
                 for (t, b) in write.into_tables() {
                     let table_data = match self.table_data(&t) {
@@ -571,19 +597,22 @@ impl NamespaceData {
                         None => self.insert_table(sequencer_id, &t, catalog).await?,
                     };
 
-                    let mut table_data = table_data.write().await;
-                    let should_pause = table_data
-                        .buffer_table_write(
-                            sequence_number,
-                            b,
-                            sequencer_id,
-                            catalog,
-                            lifecycle_handle,
-                            partitioner,
-                        )
-                        .await?;
-
-                    pause_writes = pause_writes || should_pause;
+                    {
+                        // lock scope
+                        let mut table_data = table_data.write().await;
+                        let should_pause = table_data
+                            .buffer_table_write(
+                                sequence_number,
+                                b,
+                                partition_key.clone(),
+                                sequencer_id,
+                                catalog,
+                                lifecycle_handle,
+                            )
+                            .await?;
+                        pause_writes = pause_writes || should_pause;
+                    }
+                    self.test_triggers.on_write().await;
                 }
 
                 Ok(pause_writes)
@@ -619,7 +648,7 @@ impl NamespaceData {
     pub async fn snapshot(
         &self,
         table_name: &str,
-        partition_key: &str,
+        partition_key: &PartitionKey,
     ) -> Option<(Vec<Arc<SnapshotBatch>>, Option<Arc<PersistingBatch>>)> {
         if let Some(t) = self.table_data(table_name) {
             let mut t = t.write().await;
@@ -708,7 +737,7 @@ impl NamespaceData {
     async fn mark_persisted(
         &self,
         table_name: &str,
-        partition_key: &str,
+        partition_key: &PartitionKey,
         sequence_number: SequenceNumber,
     ) {
         if let Some(t) = self.table_data(table_name) {
@@ -728,12 +757,50 @@ impl NamespaceData {
     async fn progress(&self) -> SequencerProgress {
         let tables: Vec<_> = self.tables.read().values().map(Arc::clone).collect();
 
-        let mut progress = SequencerProgress::new();
+        // Consolidate progtress across partitions.
+        let mut progress = SequencerProgress::new()
+            // Properly account for any sequence number that is
+            // actively buffering and thus not yet completely
+            // readable.
+            .actively_buffering(*self.buffering_sequence_number.read());
+
         for table_data in tables {
             progress = progress.combine(table_data.read().await.progress())
         }
-
         progress
+    }
+}
+
+/// RAAI struct that sets buffering sequence number on creation and clears it on free
+struct ScopedSequenceNumber<'a> {
+    sequence_number: SequenceNumber,
+    buffering_sequence_number: &'a RwLock<Option<SequenceNumber>>,
+}
+
+impl<'a> ScopedSequenceNumber<'a> {
+    fn new(
+        sequence_number: SequenceNumber,
+        buffering_sequence_number: &'a RwLock<Option<SequenceNumber>>,
+    ) -> Self {
+        *buffering_sequence_number.write() = Some(sequence_number);
+
+        Self {
+            sequence_number,
+            buffering_sequence_number,
+        }
+    }
+}
+
+impl<'a> Drop for ScopedSequenceNumber<'a> {
+    fn drop(&mut self) {
+        // clear write on drop
+        let mut buffering_sequence_number = self.buffering_sequence_number.write();
+        assert_eq!(
+            *buffering_sequence_number,
+            Some(self.sequence_number),
+            "multiple operations are being buffered concurrently"
+        );
+        *buffering_sequence_number = None;
     }
 }
 
@@ -744,7 +811,7 @@ pub(crate) struct TableData {
     // the max sequence number for a tombstone associated with this table
     tombstone_max_sequence_number: Option<SequenceNumber>,
     // Map pf partition key to its data
-    partition_data: BTreeMap<String, PartitionData>,
+    partition_data: BTreeMap<PartitionKey, PartitionData>,
 }
 
 impl TableData {
@@ -762,7 +829,7 @@ impl TableData {
     pub fn new_for_test(
         table_id: TableId,
         tombstone_max_sequence_number: Option<SequenceNumber>,
-        partitions: BTreeMap<String, PartitionData>,
+        partitions: BTreeMap<PartitionKey, PartitionData>,
     ) -> Self {
         Self {
             table_id,
@@ -792,19 +859,15 @@ impl TableData {
         &mut self,
         sequence_number: SequenceNumber,
         batch: MutableBatch,
+        partition_key: PartitionKey,
         sequencer_id: SequencerId,
         catalog: &dyn Catalog,
         lifecycle_handle: &dyn LifecycleHandle,
-        partitioner: &dyn Partitioner,
     ) -> Result<bool> {
-        let partition_key = partitioner
-            .partition_key(&batch)
-            .context(PartitioningSnafu)?;
-
         let partition_data = match self.partition_data.get_mut(&partition_key) {
             Some(p) => p,
             None => {
-                self.insert_partition(&partition_key, sequencer_id, catalog)
+                self.insert_partition(partition_key.clone(), sequencer_id, catalog)
                     .await?;
                 self.partition_data.get_mut(&partition_key).unwrap()
             }
@@ -885,7 +948,7 @@ impl TableData {
 
     async fn insert_partition(
         &mut self,
-        partition_key: &str,
+        partition_key: PartitionKey,
         sequencer_id: SequencerId,
         catalog: &dyn Catalog,
     ) -> Result<()> {
@@ -1414,7 +1477,7 @@ pub struct QueryableBatch {
 ///
 /// Note that this structure is specific to a partition (which itself is bound to a table and
 /// sequencer)!
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_copy_implementations)]
 pub struct PartitionStatus {
     /// Max sequence number persisted
@@ -1424,51 +1487,144 @@ pub struct PartitionStatus {
     pub tombstone_max_sequence_number: Option<SequenceNumber>,
 }
 
-/// Response sending to the query service per its request defined in IngesterQueryRequest
+/// Stream of snapshots.
+///
+/// Every snapshot is a dedicated [`SendableRecordBatchStream`].
+pub(crate) type SnapshotStream =
+    Pin<Box<dyn Stream<Item = Result<SendableRecordBatchStream, ArrowError>> + Send>>;
+
+/// Response data for a single partition.
+pub(crate) struct IngesterQueryPartition {
+    /// Stream of snapshots.
+    snapshots: SnapshotStream,
+
+    /// Partition ID.
+    id: PartitionId,
+
+    /// Partition persistence status.
+    status: PartitionStatus,
+}
+
+impl std::fmt::Debug for IngesterQueryPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngesterQueryPartition")
+            .field("snapshots", &"<SNAPSHOT STREAM>")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl IngesterQueryPartition {
+    pub(crate) fn new(snapshots: SnapshotStream, id: PartitionId, status: PartitionStatus) -> Self {
+        Self {
+            snapshots,
+            id,
+            status,
+        }
+    }
+}
+
+/// Stream of partitions in this response.
+pub(crate) type IngesterQueryPartitionStream =
+    Pin<Box<dyn Stream<Item = Result<IngesterQueryPartition, ArrowError>> + Send>>;
+
+/// Response streams for querier<>ingester requests.
+///
+/// The data structure is constructed to allow lazy/streaming data generation. For easier consumption according to the
+/// wire protocol, use the [`flatten`](Self::flatten) method.
 pub struct IngesterQueryResponse {
-    /// Stream of RecordBatch results that match the requested query
-    pub data: SendableRecordBatchStream,
-
-    /// The schema of the record batches
-    pub schema: Arc<Schema>,
-
-    /// Contains status for every partition that has unpersisted data.
-    ///
-    /// If a partition does NOT appear within this map, then either all data was persisted or the
-    /// ingester has never seen data for this partition. In either case the querier may just read
-    /// all parquet files for the missing partition.
-    pub unpersisted_partitions: BTreeMap<PartitionId, PartitionStatus>,
-
-    /// Map each record batch to a partition ID.
-    pub batch_partition_ids: Vec<PartitionId>,
+    /// Stream of partitions.
+    partitions: IngesterQueryPartitionStream,
 }
 
 impl std::fmt::Debug for IngesterQueryResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngesterQueryResponse")
-            .field("data", &"<RECORDBATCH STREAM>")
-            .field("schema", &self.schema)
-            .field("unpersisted_partitions", &self.unpersisted_partitions)
-            .field("batch_partition_ids", &self.batch_partition_ids)
+            .field("partitions", &"<PARTITION STREAM>")
             .finish()
     }
 }
 
 impl IngesterQueryResponse {
     /// Make a response
-    pub fn new(
-        data: SendableRecordBatchStream,
-        schema: Arc<Schema>,
-        unpersisted_partitions: BTreeMap<PartitionId, PartitionStatus>,
-        batch_partition_ids: Vec<PartitionId>,
-    ) -> Self {
-        Self {
-            data,
-            schema,
-            unpersisted_partitions,
-            batch_partition_ids,
-        }
+    pub(crate) fn new(partitions: IngesterQueryPartitionStream) -> Self {
+        Self { partitions }
     }
+
+    /// Flattens the data according to the wire protocol.
+    pub fn flatten(self) -> FlatIngesterQueryResponseStream {
+        self.partitions
+            .flat_map(|partition_res| match partition_res {
+                Ok(partition) => {
+                    let head = futures::stream::once(async move {
+                        Ok(FlatIngesterQueryResponse::StartPartition {
+                            partition_id: partition.id,
+                            status: partition.status,
+                        })
+                    });
+                    let tail = partition
+                        .snapshots
+                        .flat_map(|snapshot_res| match snapshot_res {
+                            Ok(snapshot) => {
+                                let schema = Arc::new(optimize_schema(&snapshot.schema()));
+
+                                let schema_captured = Arc::clone(&schema);
+                                let head = futures::stream::once(async {
+                                    Ok(FlatIngesterQueryResponse::StartSnapshot {
+                                        schema: schema_captured,
+                                    })
+                                });
+
+                                let tail = snapshot.map(move |batch_res| match batch_res {
+                                    Ok(batch) => Ok(FlatIngesterQueryResponse::RecordBatch {
+                                        batch: optimize_record_batch(&batch, Arc::clone(&schema))?,
+                                    }),
+                                    Err(e) => Err(e),
+                                });
+
+                                head.chain(tail).boxed()
+                            }
+                            Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+                        });
+
+                    head.chain(tail).boxed()
+                }
+                Err(e) => futures::stream::once(async { Err(e) }).boxed(),
+            })
+            .boxed()
+    }
+}
+
+/// Flattened version of [`IngesterQueryResponse`].
+pub type FlatIngesterQueryResponseStream =
+    Pin<Box<dyn Stream<Item = Result<FlatIngesterQueryResponse, ArrowError>> + Send>>;
+
+/// Element within the flat wire protocol.
+#[derive(Debug, PartialEq)]
+pub enum FlatIngesterQueryResponse {
+    /// Start a new partition.
+    StartPartition {
+        /// Partition ID.
+        partition_id: PartitionId,
+
+        /// Partition persistence status.
+        status: PartitionStatus,
+    },
+
+    /// Start a new snapshot.
+    ///
+    /// The snapshot belongs  to the partition of the last [`StartPartition`](Self::StartPartition) message.
+    StartSnapshot {
+        /// Snapshot schema.
+        schema: Arc<arrow::datatypes::Schema>,
+    },
+
+    /// Add a record batch to the snapshot that was announced by the last [`StartSnapshot`](Self::StartSnapshot) message.
+    RecordBatch {
+        /// Record batch.
+        batch: RecordBatch,
+    },
 }
 
 #[cfg(test)]
@@ -1476,14 +1632,15 @@ mod tests {
     use super::*;
     use crate::{
         lifecycle::{LifecycleConfig, LifecycleManager},
-        partioning::DefaultPartitioner,
         test_util::create_tombstone,
     };
+    use arrow::datatypes::SchemaRef;
     use arrow_util::assert_batches_sorted_eq;
     use assert_matches::assert_matches;
     use data_types::{
-        NamespaceSchema, NonEmptyString, ParquetFileParams, Sequence, TimestampRange,
+        ColumnSet, NamespaceSchema, NonEmptyString, ParquetFileParams, Sequence, TimestampRange,
     };
+    use datafusion::physical_plan::RecordBatchStream;
     use dml::{DmlDelete, DmlMeta, DmlWrite};
     use futures::TryStreamExt;
     use iox_catalog::{
@@ -1493,7 +1650,11 @@ mod tests {
     use metric::{MetricObserver, Observation};
     use mutable_batch_lp::{lines_to_batches, test_helpers::lp_to_mutable_batch};
     use object_store::memory::InMemory;
-    use std::{ops::DerefMut, time::Duration};
+    use std::{
+        ops::DerefMut,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     #[test]
     fn snapshot_empty_buffer_adds_no_snapshots() {
@@ -1599,7 +1760,6 @@ mod tests {
             Arc::clone(&object_store),
             Arc::clone(&catalog),
             sequencers,
-            Arc::new(DefaultPartitioner::default()),
             Arc::new(Executor::new(1)),
             BackoffConfig::default(),
         ));
@@ -1611,7 +1771,13 @@ mod tests {
         let w1 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
 
         let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
@@ -1687,7 +1853,6 @@ mod tests {
             Arc::clone(&object_store),
             Arc::clone(&catalog),
             sequencers,
-            Arc::new(DefaultPartitioner::default()),
             Arc::new(Executor::new(1)),
             BackoffConfig::default(),
         ));
@@ -1699,9 +1864,14 @@ mod tests {
         let w1 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
-        // drop repos so the mem catalog won't deadlock.
         let schema = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
             .await
             .unwrap()
@@ -1710,18 +1880,31 @@ mod tests {
         let w2 = DmlWrite::new(
             "foo",
             lines_to_batches("cpu foo=1 10", 1).unwrap(),
-            DmlMeta::sequenced(Sequence::new(2, 1), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(2, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
         let _ = validate_or_insert_schema(w2.tables(), &schema, repos.deref_mut())
             .await
             .unwrap()
             .unwrap();
 
+        // drop repos so the mem catalog won't deadlock.
         std::mem::drop(repos);
         let w3 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 30", 2).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 2), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(2)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
 
         let manager = LifecycleManager::new(
@@ -1740,16 +1923,10 @@ mod tests {
             .await
             .unwrap();
 
-        // check progresses
-        let progresses = data.progresses(vec![kafka_partition]).await;
-        let mut expected_progresses = BTreeMap::new();
-        expected_progresses.insert(
-            kafka_partition,
-            SequencerProgress::new()
-                .with_buffered(SequenceNumber::new(1))
-                .with_buffered(SequenceNumber::new(2)),
-        );
-        assert_eq!(progresses, expected_progresses);
+        let expected_progress = SequencerProgress::new()
+            .with_buffered(SequenceNumber::new(1))
+            .with_buffered(SequenceNumber::new(2));
+        assert_progress(&data, kafka_partition, expected_progress).await;
 
         let sd = data.sequencers.get(&sequencer1.id).unwrap();
         let n = sd.namespace("foo").unwrap();
@@ -1759,7 +1936,7 @@ mod tests {
             let mem_table = n.table_data("mem").unwrap();
             assert!(n.table_data("cpu").is_some());
             let mem_table = mem_table.write().await;
-            let p = mem_table.partition_data.get("1970-01-01").unwrap();
+            let p = mem_table.partition_data.get(&"1970-01-01".into()).unwrap();
 
             table_id = mem_table.table_id;
             partition_id = p.id;
@@ -1773,7 +1950,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(partition_info.partition.sort_key.is_none());
+            assert!(partition_info.partition.sort_key.is_empty());
         }
 
         data.persist(partition_id).await;
@@ -1813,7 +1990,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(partition_info.partition.sort_key.unwrap(), "time");
+        assert_eq!(partition_info.partition.sort_key, vec!["time"]);
 
         let mem_table = n.table_data("mem").unwrap();
         let mem_table = mem_table.read().await;
@@ -1825,15 +2002,144 @@ mod tests {
         );
 
         // check progresses after persist
-        let progresses = data.progresses(vec![kafka_partition]).await;
-        let mut expected_progresses = BTreeMap::new();
-        expected_progresses.insert(
-            kafka_partition,
-            SequencerProgress::new()
-                .with_buffered(SequenceNumber::new(1))
-                .with_persisted(SequenceNumber::new(2)),
+        let expected_progress = SequencerProgress::new()
+            .with_buffered(SequenceNumber::new(1))
+            .with_persisted(SequenceNumber::new(2));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+    }
+
+    #[tokio::test]
+    async fn partial_write_progress() {
+        test_helpers::maybe_start_logging();
+        let metrics = Arc::new(metric::Registry::new());
+        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+        let mut repos = catalog.repositories().await;
+        let kafka_topic = repos.kafka_topics().create_or_get("whatevs").await.unwrap();
+        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
+        let kafka_partition = KafkaPartition::new(0);
+        let namespace = repos
+            .namespaces()
+            .create("foo", "inf", kafka_topic.id, query_pool.id)
+            .await
+            .unwrap();
+        let sequencer1 = repos
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let sequencer2 = repos
+            .sequencers()
+            .create_or_get(&kafka_topic, kafka_partition)
+            .await
+            .unwrap();
+        let mut sequencers = BTreeMap::new();
+        sequencers.insert(
+            sequencer1.id,
+            SequencerData::new(sequencer1.kafka_partition, Arc::clone(&metrics)),
         );
-        assert_eq!(progresses, expected_progresses);
+        sequencers.insert(
+            sequencer2.id,
+            SequencerData::new(sequencer2.kafka_partition, Arc::clone(&metrics)),
+        );
+
+        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+
+        let data = Arc::new(IngesterData::new(
+            Arc::clone(&object_store),
+            Arc::clone(&catalog),
+            sequencers,
+            Arc::new(Executor::new(1)),
+            BackoffConfig::default(),
+        ));
+
+        let schema = NamespaceSchema::new(namespace.id, kafka_topic.id, query_pool.id);
+
+        let ignored_ts = Time::from_timestamp_millis(42);
+
+        // write with sequence number 1
+        let w1 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 10", 0).unwrap(),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
+        );
+        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // write with sequence number 2
+        let w2 = DmlWrite::new(
+            "foo",
+            lines_to_batches("mem foo=1 30\ncpu bar=1 20", 0).unwrap(),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(2)),
+                ignored_ts,
+                None,
+                50,
+            ),
+        );
+        let _ = validate_or_insert_schema(w2.tables(), &schema, repos.deref_mut())
+            .await
+            .unwrap()
+            .unwrap();
+
+        drop(repos); // release catalog transaction
+
+        let manager = LifecycleManager::new(
+            LifecycleConfig::new(1, 0, 0, Duration::from_secs(1), Duration::from_secs(1)),
+            metrics,
+            Arc::new(SystemProvider::new()),
+        );
+
+        // buffer operation 1, expect progress buffered sequence number should be 1
+        data.buffer_operation(sequencer1.id, DmlOperation::Write(w1), &manager.handle())
+            .await
+            .unwrap();
+
+        // Get the namespace
+        let sd = data.sequencers.get(&sequencer1.id).unwrap();
+        let n = sd.namespace("foo").unwrap();
+
+        let expected_progress = SequencerProgress::new().with_buffered(SequenceNumber::new(1));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+
+        // configure the the namespace to wait after each insert.
+        n.test_triggers.enable_pause_after_write().await;
+
+        // now, buffer operation 2 which has two tables,
+        let captured_data = Arc::clone(&data);
+        let task = tokio::task::spawn(async move {
+            captured_data
+                .buffer_operation(sequencer1.id, DmlOperation::Write(w2), &manager.handle())
+                .await
+                .unwrap();
+        });
+
+        n.test_triggers.wait_for_pause_after_write().await;
+
+        // Check that while the write is only partially complete, the
+        // buffered sequence number hasn't increased
+        let expected_progress = SequencerProgress::new()
+            // sequence 2 hasn't been buffered yet
+            .with_buffered(SequenceNumber::new(1));
+        assert_progress(&data, kafka_partition, expected_progress).await;
+
+        // allow the write to complete
+        n.test_triggers.release_pause_after_write().await;
+        task.await.expect("task completed unsuccessfully");
+
+        // check progresses after the write completes
+        let expected_progress = SequencerProgress::new()
+            .with_buffered(SequenceNumber::new(1))
+            .with_buffered(SequenceNumber::new(2));
+        assert_progress(&data, kafka_partition, expected_progress).await;
     }
 
     // Test deletes mixed with writes on a single parittion
@@ -2114,12 +2420,24 @@ mod tests {
         let w1 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
         let w2 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 2), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(2)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
 
         let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
@@ -2135,12 +2453,12 @@ mod tests {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("1970-01-01", sequencer.id, table.id)
+            .create_or_get("1970-01-01".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("1970-01-02", sequencer.id, table.id)
+            .create_or_get("1970-01-02".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2159,6 +2477,7 @@ mod tests {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         repos
             .parquet_files()
@@ -2188,7 +2507,6 @@ mod tests {
             Arc::clone(&metrics),
             Arc::new(SystemProvider::new()),
         );
-        let partitioner = DefaultPartitioner::default();
         let exec = Executor::new(1);
 
         let data = NamespaceData::new(namespace.id, &*metrics);
@@ -2200,7 +2518,6 @@ mod tests {
                 sequencer.id,
                 catalog.as_ref(),
                 &manager.handle(),
-                &partitioner,
                 &exec,
             )
             .await
@@ -2208,7 +2525,7 @@ mod tests {
         {
             let table_data = data.table_data("mem").unwrap();
             let table = table_data.read().await;
-            let p = table.partition_data.get("1970-01-01").unwrap();
+            let p = table.partition_data.get(&"1970-01-01".into()).unwrap();
             assert_eq!(
                 p.data.max_persisted_sequence_number,
                 Some(SequenceNumber::new(1))
@@ -2223,7 +2540,6 @@ mod tests {
             sequencer.id,
             catalog.as_ref(),
             &manager.handle(),
-            &partitioner,
             &exec,
         )
         .await
@@ -2231,7 +2547,7 @@ mod tests {
 
         let table_data = data.table_data("mem").unwrap();
         let table = table_data.read().await;
-        let partition = table.partition_data.get("1970-01-01").unwrap();
+        let partition = table.partition_data.get(&"1970-01-01".into()).unwrap();
         assert_eq!(
             partition.data.buffer.as_ref().unwrap().min_sequence_number,
             SequenceNumber::new(2)
@@ -2274,7 +2590,6 @@ mod tests {
             Arc::clone(&object_store),
             Arc::clone(&catalog),
             sequencers,
-            Arc::new(DefaultPartitioner::default()),
             Arc::new(Executor::new(1)),
             BackoffConfig::default(),
         ));
@@ -2286,7 +2601,13 @@ mod tests {
         let w1 = DmlWrite::new(
             "foo",
             lines_to_batches("mem foo=1 10", 0).unwrap(),
-            DmlMeta::sequenced(Sequence::new(1, 1), ignored_ts, None, 50),
+            Some("1970-01-01".into()),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(1)),
+                ignored_ts,
+                None,
+                50,
+            ),
         );
 
         let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
@@ -2336,7 +2657,12 @@ mod tests {
             "foo",
             predicate,
             Some(NonEmptyString::new("mem").unwrap()),
-            DmlMeta::sequenced(Sequence::new(1, 2), ignored_ts, None, 1337),
+            DmlMeta::sequenced(
+                Sequence::new(1, SequenceNumber::new(2)),
+                ignored_ts,
+                None,
+                1337,
+            ),
         );
         data.buffer_operation(sequencer1.id, DmlOperation::Delete(d1), &manager.handle())
             .await
@@ -2354,5 +2680,147 @@ mod tests {
                 .tombstone_max_sequence_number(),
             Some(SequenceNumber::new(2)),
         );
+    }
+
+    /// Verifies that the progress in data is the same as expected_progress
+    async fn assert_progress(
+        data: &IngesterData,
+        kafka_partition: KafkaPartition,
+        expected_progress: SequencerProgress,
+    ) {
+        let progresses = data.progresses(vec![kafka_partition]).await;
+        let expected_progresses = [(kafka_partition, expected_progress)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(progresses, expected_progresses);
+    }
+
+    #[tokio::test]
+    async fn test_ingester_query_response_flatten() {
+        let batch_1_1 = lp_to_batch("table x=1 0");
+        let batch_1_2 = lp_to_batch("table x=2 1");
+        let batch_2 = lp_to_batch("table y=1 10");
+        let batch_3 = lp_to_batch("table z=1 10");
+
+        let schema_1 = batch_1_1.schema();
+        let schema_2 = batch_2.schema();
+        let schema_3 = batch_3.schema();
+
+        let response = IngesterQueryResponse::new(Box::pin(futures::stream::iter([
+            Ok(IngesterQueryPartition::new(
+                Box::pin(futures::stream::iter([
+                    Ok(Box::pin(TestRecordBatchStream::new(
+                        vec![
+                            Ok(batch_1_1.clone()),
+                            Err(ArrowError::NotYetImplemented("not yet implemeneted".into())),
+                            Ok(batch_1_2.clone()),
+                        ],
+                        Arc::clone(&schema_1),
+                    )) as _),
+                    Err(ArrowError::InvalidArgumentError("invalid arg".into())),
+                    Ok(Box::pin(TestRecordBatchStream::new(
+                        vec![Ok(batch_2.clone())],
+                        Arc::clone(&schema_2),
+                    )) as _),
+                    Ok(Box::pin(TestRecordBatchStream::new(vec![], Arc::clone(&schema_3))) as _),
+                ])),
+                PartitionId::new(2),
+                PartitionStatus {
+                    parquet_max_sequence_number: None,
+                    tombstone_max_sequence_number: Some(SequenceNumber::new(1)),
+                },
+            )),
+            Err(ArrowError::IoError("some io error".into())),
+            Ok(IngesterQueryPartition::new(
+                Box::pin(futures::stream::iter([])),
+                PartitionId::new(1),
+                PartitionStatus {
+                    parquet_max_sequence_number: None,
+                    tombstone_max_sequence_number: None,
+                },
+            )),
+        ])));
+
+        let actual: Vec<_> = response.flatten().collect().await;
+        let expected = vec![
+            Ok(FlatIngesterQueryResponse::StartPartition {
+                partition_id: PartitionId::new(2),
+                status: PartitionStatus {
+                    parquet_max_sequence_number: None,
+                    tombstone_max_sequence_number: Some(SequenceNumber::new(1)),
+                },
+            }),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_1 }),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_1_1 }),
+            Err(ArrowError::NotYetImplemented("not yet implemeneted".into())),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_1_2 }),
+            Err(ArrowError::InvalidArgumentError("invalid arg".into())),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_2 }),
+            Ok(FlatIngesterQueryResponse::RecordBatch { batch: batch_2 }),
+            Ok(FlatIngesterQueryResponse::StartSnapshot { schema: schema_3 }),
+            Err(ArrowError::IoError("some io error".into())),
+            Ok(FlatIngesterQueryResponse::StartPartition {
+                partition_id: PartitionId::new(1),
+                status: PartitionStatus {
+                    parquet_max_sequence_number: None,
+                    tombstone_max_sequence_number: None,
+                },
+            }),
+        ];
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual, expected);
+                }
+                (Err(_), Err(_)) => {
+                    // cannot compare `ArrowError`, but it's unlikely that someone changed the error
+                }
+                (Ok(_), Err(_)) => panic!("Actual is Ok but expected is Err"),
+                (Err(_), Ok(_)) => panic!("Actual is Err but expected is Ok"),
+            }
+        }
+    }
+
+    fn lp_to_batch(lp: &str) -> RecordBatch {
+        lp_to_mutable_batch(lp).1.to_arrow(Selection::All).unwrap()
+    }
+
+    pub struct TestRecordBatchStream {
+        schema: SchemaRef,
+        batches: Vec<Result<RecordBatch, ArrowError>>,
+    }
+
+    impl TestRecordBatchStream {
+        pub fn new(batches: Vec<Result<RecordBatch, ArrowError>>, schema: SchemaRef) -> Self {
+            Self { schema, batches }
+        }
+    }
+
+    impl RecordBatchStream for TestRecordBatchStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    impl futures::Stream for TestRecordBatchStream {
+        type Item = Result<RecordBatch, ArrowError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if self.batches.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(self.batches.remove(0)))
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.batches.len(), Some(self.batches.len()))
+        }
     }
 }

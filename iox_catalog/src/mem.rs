@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use data_types::{
     Column, ColumnId, ColumnType, KafkaPartition, KafkaTopic, KafkaTopicId, Namespace, NamespaceId,
     ParquetFile, ParquetFileId, ParquetFileParams, ParquetFileWithMetadata, Partition, PartitionId,
-    PartitionInfo, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Sequencer,
-    SequencerId, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId,
+    PartitionInfo, PartitionKey, ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber,
+    Sequencer, SequencerId, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use observability_deps::tracing::warn;
@@ -609,7 +609,7 @@ impl SequencerRepo for MemTxn {
                     id: SequencerId::new(stage.sequencers.len() as i64 + 1),
                     kafka_topic_id: topic.id,
                     kafka_partition: partition,
-                    min_unpersisted_sequence_number: 0,
+                    min_unpersisted_sequence_number: SequenceNumber::new(0),
                 };
                 stage.sequencers.push(sequencer);
                 stage.sequencers.last().unwrap()
@@ -660,7 +660,7 @@ impl SequencerRepo for MemTxn {
         let stage = self.stage();
 
         if let Some(s) = stage.sequencers.iter_mut().find(|s| s.id == sequencer_id) {
-            s.min_unpersisted_sequence_number = sequence_number.get()
+            s.min_unpersisted_sequence_number = sequence_number
         };
 
         Ok(())
@@ -671,7 +671,7 @@ impl SequencerRepo for MemTxn {
 impl PartitionRepo for MemTxn {
     async fn create_or_get(
         &mut self,
-        key: &str,
+        key: PartitionKey,
         sequencer_id: SequencerId,
         table_id: TableId,
     ) -> Result<Partition> {
@@ -686,8 +686,8 @@ impl PartitionRepo for MemTxn {
                     id: PartitionId::new(stage.partitions.len() as i64 + 1),
                     sequencer_id,
                     table_id,
-                    partition_key: key.to_string(),
-                    sort_key: None,
+                    partition_key: key,
+                    sort_key: vec![],
                 };
                 stage.partitions.push(p);
                 stage.partitions.last().unwrap()
@@ -788,12 +788,12 @@ impl PartitionRepo for MemTxn {
     async fn update_sort_key(
         &mut self,
         partition_id: PartitionId,
-        sort_key: &str,
+        sort_key: &[&str],
     ) -> Result<Partition> {
         let stage = self.stage();
         match stage.partitions.iter_mut().find(|p| p.id == partition_id) {
             Some(p) => {
-                p.sort_key = Some(sort_key.to_string());
+                p.sort_key = sort_key.iter().map(|s| s.to_string()).collect();
                 Ok(p.clone())
             }
             None => Err(Error::PartitionNotFound { id: partition_id }),
@@ -951,6 +951,7 @@ impl ParquetFileRepo for MemTxn {
             row_count,
             compaction_level,
             created_at,
+            column_set,
         } = parquet_file_params;
 
         if stage
@@ -977,6 +978,7 @@ impl ParquetFileRepo for MemTxn {
             file_size_bytes,
             compaction_level,
             created_at,
+            column_set,
         };
 
         stage
@@ -984,7 +986,7 @@ impl ParquetFileRepo for MemTxn {
             .insert(parquet_file.id, parquet_metadata);
 
         stage.parquet_files.push(parquet_file);
-        Ok(*stage.parquet_files.last().unwrap())
+        Ok(stage.parquet_files.last().unwrap().clone())
     }
 
     async fn flag_for_delete(&mut self, id: ParquetFileId) -> Result<()> {
@@ -1059,11 +1061,13 @@ impl ParquetFileRepo for MemTxn {
             .filter(|f| table_id == f.table_id && f.to_delete.is_none())
             .cloned()
             .map(|f| {
+                let parquet_file_id = f.id;
+
                 ParquetFileWithMetadata::new(
                     f,
                     stage
                         .parquet_file_metadata
-                        .get(&f.id)
+                        .get(&parquet_file_id)
                         .cloned()
                         .unwrap_or_default(),
                 )
@@ -1151,11 +1155,13 @@ impl ParquetFileRepo for MemTxn {
             .filter(|f| f.partition_id == partition_id && f.to_delete.is_none())
             .cloned()
             .map(|f| {
+                let parquet_file_id = f.id;
+
                 ParquetFileWithMetadata::new(
                     f,
                     stage
                         .parquet_file_metadata
-                        .get(&f.id)
+                        .get(&parquet_file_id)
                         .cloned()
                         .unwrap_or_default(),
                 )

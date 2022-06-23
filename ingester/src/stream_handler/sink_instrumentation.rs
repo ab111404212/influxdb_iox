@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use data_types::KafkaPartition;
 use dml::DmlOperation;
 use iox_time::{SystemProvider, TimeProvider};
-use metric::{Attributes, U64Counter, U64Gauge, U64Histogram, U64HistogramOptions};
+use metric::{Attributes, DurationHistogram, U64Counter, U64Gauge};
 use std::fmt::Debug;
 use trace::span::SpanRecorder;
 
@@ -17,7 +17,7 @@ use trace::span::SpanRecorder;
 /// Implementations may cache the watermark and return inaccurate values.
 pub trait WatermarkFetcher: Debug + Send + Sync {
     /// Return a watermark if available.
-    fn watermark(&self) -> Option<u64>;
+    fn watermark(&self) -> Option<i64>;
 }
 
 /// A [`SinkInstrumentation`] decorates a [`DmlSink`] implementation and records
@@ -52,8 +52,8 @@ pub struct SinkInstrumentation<F, T, P = SystemProvider> {
 
     /// Op application success/failure call latency histograms (which include
     /// counters)
-    op_apply_success_ms: U64Histogram,
-    op_apply_error_ms: U64Histogram,
+    op_apply_success: DurationHistogram,
+    op_apply_error: DurationHistogram,
 
     /// Write buffer metrics
     write_buffer_bytes_read: U64Counter,
@@ -90,58 +90,37 @@ where
 
         let write_buffer_bytes_read = metrics
             .register_metric::<U64Counter>(
-                "write_buffer_read_bytes",
+                "ingester_write_buffer_read_bytes",
                 "Total number of bytes read from sequencer",
             )
             .recorder(attr.clone());
         let write_buffer_last_sequence_number = metrics
             .register_metric::<U64Gauge>(
-                "write_buffer_last_sequence_number",
+                "ingester_write_buffer_last_sequence_number",
                 "Last consumed sequence number (e.g. Kafka offset)",
             )
             .recorder(attr.clone());
         let write_buffer_sequence_number_lag = metrics.register_metric::<U64Gauge>(
-            "write_buffer_sequence_number_lag",
+            "ingester_write_buffer_sequence_number_lag",
             "The difference between the the last sequence number available (e.g. Kafka offset) and (= minus) last consumed sequence number",
         ).recorder(attr.clone());
         let write_buffer_last_ingest_ts = metrics
             .register_metric::<U64Gauge>(
-                "write_buffer_last_ingest_ts",
+                "ingester_write_buffer_last_ingest_ts",
                 "Last seen ingest timestamp as unix timestamp in nanoseconds",
             )
             .recorder(attr.clone());
 
-        // The buckets for the op apply histogram
-        let buckets = || {
-            U64HistogramOptions::new([
-                5,
-                10,
-                20,
-                40,
-                80,
-                160,
-                320,
-                640,
-                1280,
-                2560,
-                5120,
-                10240,
-                20480,
-                u64::MAX,
-            ])
-        };
-
-        let op_apply = metrics.register_metric_with_options::<U64Histogram, _>(
-            "ingester_op_apply_duration_ms",
+        let op_apply = metrics.register_metric::<DurationHistogram>(
+            "ingester_op_apply_duration",
             "The duration of time taken to process an operation read from the sequencer",
-            buckets,
         );
-        let op_apply_success_ms = op_apply.recorder({
+        let op_apply_success = op_apply.recorder({
             let mut attr = attr.clone();
             attr.insert("result", "success");
             attr
         });
-        let op_apply_error_ms = op_apply.recorder({
+        let op_apply_error = op_apply.recorder({
             let mut attr = attr;
             attr.insert("result", "error");
             attr
@@ -152,8 +131,8 @@ where
             watermark_fetcher,
             sequencer_id: kafka_partition.get(),
 
-            op_apply_success_ms,
-            op_apply_error_ms,
+            op_apply_success,
+            op_apply_error,
 
             write_buffer_bytes_read,
             write_buffer_last_sequence_number,
@@ -205,14 +184,15 @@ where
 
         // Record the "last read sequence number" write buffer metric.
         self.write_buffer_last_sequence_number
-            .set(sequence.sequence_number);
+            .set(sequence.sequence_number.get() as u64);
 
         // If it is possible to obtain the sequence number of the most recent op
         // inserted into the queue, record how far behind the op is.
         if let Some(watermark) = self.watermark_fetcher.watermark() {
+            let watermark = watermark as u64;
             self.write_buffer_sequence_number_lag.set(
                 watermark
-                    .saturating_sub(sequence.sequence_number)
+                    .saturating_sub(sequence.sequence_number.get() as u64)
                     .saturating_sub(1),
             );
         }
@@ -234,14 +214,14 @@ where
             let metric = match &res {
                 Ok(_) => {
                     span_recorder.ok("success");
-                    &self.op_apply_success_ms
+                    &self.op_apply_success
                 }
                 Err(e) => {
                     span_recorder.error(e.to_string());
-                    &self.op_apply_error_ms
+                    &self.op_apply_error
                 }
             };
-            metric.record(delta.as_millis() as _);
+            metric.record(delta);
         }
 
         // Return the result from the inner handler unmodified
@@ -254,7 +234,7 @@ mod tests {
     use std::sync::Arc;
 
     use assert_matches::assert_matches;
-    use data_types::Sequence;
+    use data_types::{Sequence, SequenceNumber};
     use dml::{DmlMeta, DmlWrite};
     use iox_time::Time;
     use metric::{Metric, MetricObserver, Observation};
@@ -287,7 +267,7 @@ mod tests {
     /// Return a DmlWrite with the given metadata and a single table.
     fn make_write(meta: DmlMeta) -> DmlWrite {
         let tables = lines_to_batches("bananas level=42 4242", 0).unwrap();
-        DmlWrite::new("bananas", tables, meta)
+        DmlWrite::new("bananas", tables, None, meta)
     }
 
     /// Extract the metric with the given name from `metrics`.
@@ -310,7 +290,7 @@ mod tests {
         op: impl Into<DmlOperation> + Send,
         metrics: &metric::Registry,
         with_sink_return: Result<bool, crate::data::Error>,
-        with_fetcher_return: Option<u64>,
+        with_fetcher_return: Option<i64>,
     ) -> Result<bool, crate::data::Error> {
         let op = op.into();
         let inner = MockDmlSink::default().with_apply_return([with_sink_return]);
@@ -352,7 +332,7 @@ mod tests {
 
         let meta = DmlMeta::sequenced(
             // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, 100),
+            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
@@ -364,13 +344,17 @@ mod tests {
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(&metrics, "write_buffer_read_bytes", &*DEFAULT_ATTRS),
+            get_metric::<U64Counter>(
+                &metrics,
+                "ingester_write_buffer_read_bytes",
+                &*DEFAULT_ATTRS
+            ),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_last_sequence_number",
+                "ingester_write_buffer_last_sequence_number",
                 &*DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
@@ -378,14 +362,14 @@ mod tests {
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_sequence_number_lag",
+                "ingester_write_buffer_sequence_number_lag",
                 &*DEFAULT_ATTRS
             ),
             // 12345 - 100 - 1
             Observation::U64Gauge(12_244)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -393,12 +377,12 @@ mod tests {
         );
 
         // Validate the success histogram was hit
-        let hist = get_metric::<U64Histogram>(&metrics, "ingester_op_apply_duration_ms", &{
+        let hist = get_metric::<DurationHistogram>(&metrics, "ingester_op_apply_duration", &{
             let mut attrs = DEFAULT_ATTRS.clone();
             attrs.insert("result", "success");
             attrs
         });
-        assert_matches!(hist, Observation::U64Histogram(h) => {
+        assert_matches!(hist, Observation::DurationHistogram(h) => {
             let hits: u64 = h.buckets.iter().map(|b| b.count).sum();
             assert_eq!(hits, 1);
         });
@@ -417,7 +401,7 @@ mod tests {
 
         let meta = DmlMeta::sequenced(
             // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, 100),
+            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
@@ -427,21 +411,25 @@ mod tests {
         let got = test(
             op,
             &metrics,
-            Err(crate::data::Error::PersistingEmpty),
+            Err(crate::data::Error::TableNotPresent),
             Some(12345),
         )
         .await;
-        assert_matches!(got, Err(crate::data::Error::PersistingEmpty));
+        assert_matches!(got, Err(crate::data::Error::TableNotPresent));
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(&metrics, "write_buffer_read_bytes", &*DEFAULT_ATTRS),
+            get_metric::<U64Counter>(
+                &metrics,
+                "ingester_write_buffer_read_bytes",
+                &*DEFAULT_ATTRS
+            ),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_last_sequence_number",
+                "ingester_write_buffer_last_sequence_number",
                 &*DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
@@ -449,14 +437,14 @@ mod tests {
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_sequence_number_lag",
+                "ingester_write_buffer_sequence_number_lag",
                 &*DEFAULT_ATTRS
             ),
             // 12345 - 100 - 1
             Observation::U64Gauge(12_244)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -464,12 +452,12 @@ mod tests {
         );
 
         // Validate the histogram was hit even on error
-        let hist = get_metric::<U64Histogram>(&metrics, "ingester_op_apply_duration_ms", &{
+        let hist = get_metric::<DurationHistogram>(&metrics, "ingester_op_apply_duration", &{
             let mut attrs = DEFAULT_ATTRS.clone();
             attrs.insert("result", "error");
             attrs
         });
-        assert_matches!(hist, Observation::U64Histogram(h) => {
+        assert_matches!(hist, Observation::DurationHistogram(h) => {
             let hits: u64 = h.buckets.iter().map(|b| b.count).sum();
             assert_eq!(hits, 1);
         });
@@ -487,7 +475,7 @@ mod tests {
 
         let meta = DmlMeta::sequenced(
             // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, 100),
+            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
@@ -499,13 +487,17 @@ mod tests {
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(&metrics, "write_buffer_read_bytes", &*DEFAULT_ATTRS),
+            get_metric::<U64Counter>(
+                &metrics,
+                "ingester_write_buffer_read_bytes",
+                &*DEFAULT_ATTRS
+            ),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_last_sequence_number",
+                "ingester_write_buffer_last_sequence_number",
                 &*DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
@@ -513,14 +505,14 @@ mod tests {
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_sequence_number_lag",
+                "ingester_write_buffer_sequence_number_lag",
                 &*DEFAULT_ATTRS
             ),
             // No value recorded because no watermark was available
             Observation::U64Gauge(0)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -528,12 +520,12 @@ mod tests {
         );
 
         // Validate the success histogram was hit
-        let hist = get_metric::<U64Histogram>(&metrics, "ingester_op_apply_duration_ms", &{
+        let hist = get_metric::<DurationHistogram>(&metrics, "ingester_op_apply_duration", &{
             let mut attrs = DEFAULT_ATTRS.clone();
             attrs.insert("result", "success");
             attrs
         });
-        assert_matches!(hist, Observation::U64Histogram(h) => {
+        assert_matches!(hist, Observation::DurationHistogram(h) => {
             let hits: u64 = h.buckets.iter().map(|b| b.count).sum();
             assert_eq!(hits, 1);
         });
@@ -552,7 +544,7 @@ mod tests {
 
         let meta = DmlMeta::sequenced(
             // Op is offset 100 for sequencer 42
-            Sequence::new(SEQUENCER_ID, 100),
+            Sequence::new(SEQUENCER_ID, SequenceNumber::new(100)),
             *TEST_TIME,
             Some(span),
             4242,
@@ -564,13 +556,17 @@ mod tests {
 
         // Validate the various write buffer metrics
         assert_matches!(
-            get_metric::<U64Counter>(&metrics, "write_buffer_read_bytes", &*DEFAULT_ATTRS),
+            get_metric::<U64Counter>(
+                &metrics,
+                "ingester_write_buffer_read_bytes",
+                &*DEFAULT_ATTRS
+            ),
             Observation::U64Counter(4242)
         );
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_last_sequence_number",
+                "ingester_write_buffer_last_sequence_number",
                 &*DEFAULT_ATTRS
             ),
             Observation::U64Gauge(100)
@@ -578,14 +574,14 @@ mod tests {
         assert_matches!(
             get_metric::<U64Gauge>(
                 &metrics,
-                "write_buffer_sequence_number_lag",
+                "ingester_write_buffer_sequence_number_lag",
                 &*DEFAULT_ATTRS
             ),
             // The current sequence number is not behind the high watermark
             Observation::U64Gauge(0)
         );
         assert_matches!(
-            get_metric::<U64Gauge>(&metrics, "write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
+            get_metric::<U64Gauge>(&metrics, "ingester_write_buffer_last_ingest_ts", &*DEFAULT_ATTRS),
             // 12345 - 100 - 1
             Observation::U64Gauge(t) => {
                 assert_eq!(t, TEST_TIME.timestamp_nanos() as u64);
@@ -593,12 +589,12 @@ mod tests {
         );
 
         // Validate the success histogram was hit
-        let hist = get_metric::<U64Histogram>(&metrics, "ingester_op_apply_duration_ms", &{
+        let hist = get_metric::<DurationHistogram>(&metrics, "ingester_op_apply_duration", &{
             let mut attrs = DEFAULT_ATTRS.clone();
             attrs.insert("result", "success");
             attrs
         });
-        assert_matches!(hist, Observation::U64Histogram(h) => {
+        assert_matches!(hist, Observation::DurationHistogram(h) => {
             let hits: u64 = h.buckets.iter().map(|b| b.count).sum();
             assert_eq!(hits, 1);
         });
@@ -628,7 +624,7 @@ mod tests {
         let meta = DmlMeta::sequenced(
             // A different kafka partition ID from what the handler is configured to
             // be instrumenting
-            Sequence::new(SEQUENCER_ID + 10, 100),
+            Sequence::new(SEQUENCER_ID + 10, SequenceNumber::new(100)),
             *TEST_TIME,
             None,
             4242,

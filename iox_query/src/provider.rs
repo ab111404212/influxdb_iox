@@ -21,7 +21,7 @@ use datafusion::{
     },
 };
 use observability_deps::tracing::{debug, trace, warn};
-use predicate::{Predicate, PredicateBuilder};
+use predicate::Predicate;
 use schema::{merge::SchemaMerger, sort::SortKey, InfluxColumnType, Schema};
 
 use crate::{
@@ -251,9 +251,7 @@ impl TableProvider for ChunkTableProvider {
         // Note that `filters` don't actually need to be evaluated in
         // the scan for the plans to be correct, they are an extra
         // optimization for providers which can offer them
-        let predicate = PredicateBuilder::default()
-            .add_pushdown_exprs(filters)
-            .build();
+        let predicate = Predicate::default().with_pushdown_exprs(filters);
 
         // Now we have a second attempt to prune out chunks based on
         // metadata using the pushed down predicate (e.g. in SQL).
@@ -453,7 +451,7 @@ impl Deduplicater {
                 assert!(
                     pk_schema.len() <= sort_key.len(),
                     "output_sort_key ({:?}) must be at least as long as the primary key ({:?})",
-                    sort_key.to_columns(),
+                    sort_key.to_columns().collect::<Vec<_>>(),
                     pk_schema,
                 );
                 assert!(
@@ -932,17 +930,19 @@ impl Deduplicater {
     /// Return a sort plan for for a given chunk
     /// This plan is applied for every chunk to read data from chunk
     /// The plan will look like this. Reading bottom up:
-    ///   1. First we scan the data in IOxReadFilterNode which represents
-    ///        a custom implemented scan of MUB, RUB, OS. Both Select Predicate of
-    ///        the query and Delete Predicates of the chunk is pushed down
-    ///        here to eliminate as much data as early as possible but it is not guaranteed
-    ///        all filters are applied because only certain expressions work
-    ///        at this low chunk scan level.
-    ///        Delete Predicates are tombstone of deleted data that will be eliminated at read time.
-    ///   2. If the chunk has Delete Predicates, the FilterExec will be added to filter data out
-    ///       We apply delete predicate filter at this low level because the Delete Predicates are chunk specific.
-    ///   3. Then SortExec is added if there is a request to sort this chunk at this stage
-    ///       See the description of function build_scan_plan to see why the sort may be needed
+    ///
+    ///   1. First we scan the data in IOxReadFilterNode which represents a custom implemented scan
+    ///      of the chunk. Both Select Predicate of the query and Delete Predicates of the chunk is
+    ///      pushed down here to eliminate as much data as early as possible but it is not
+    ///      guaranteed all filters are applied because only certain expressions work at this low
+    ///      chunk scan level. Delete Predicates are tombstone of deleted data that will be
+    ///      eliminated at read time.
+    ///   2. If the chunk has Delete Predicates, the FilterExec will be added to filter data out.
+    ///      We apply delete predicate filter at this low level because the Delete Predicates are
+    ///      chunk specific.
+    ///   3. Then SortExec is added if there is a request to sort this chunk at this stage.
+    ///      See the description of function build_scan_plan to see why the sort may be needed.
+    ///
     /// ```text
     ///                ┌─────────────────┐
     ///                │ ProjectionExec  │

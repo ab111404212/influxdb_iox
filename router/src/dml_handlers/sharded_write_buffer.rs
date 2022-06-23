@@ -1,7 +1,7 @@
 //! Logic to shard writes/deletes and push them into a write buffer sequencer.
 
 use super::Partitioned;
-use crate::{dml_handlers::DmlHandler, sequencer::Sequencer, sharder::Sharder};
+use crate::{dml_handlers::DmlHandler, sequencer::Sequencer};
 use async_trait::async_trait;
 use data_types::{DatabaseName, DeletePredicate, NonEmptyString};
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
@@ -9,6 +9,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
 use mutable_batch::MutableBatch;
 use observability_deps::tracing::*;
+use sharder::Sharder;
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
@@ -115,7 +116,12 @@ where
         }
 
         let iter = collated.into_iter().map(|(sequencer, batch)| {
-            let dml = DmlWrite::new(namespace, batch, DmlMeta::unsequenced(span_ctx.clone()));
+            let dml = DmlWrite::new(
+                namespace,
+                batch,
+                Some(partition_key.clone()),
+                DmlMeta::unsequenced(span_ctx.clone()),
+            );
 
             trace!(
                 %partition_key,
@@ -203,12 +209,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        dml_handlers::DmlHandler,
-        sharder::mock::{MockSharder, MockSharderCall, MockSharderPayload},
-    };
+    use crate::dml_handlers::DmlHandler;
     use assert_matches::assert_matches;
     use data_types::TimestampRange;
+    use sharder::mock::{MockSharder, MockSharderCall, MockSharderPayload};
     use std::sync::Arc;
     use write_buffer::mock::{MockBufferForWriting, MockBufferSharedState};
 
@@ -216,7 +220,7 @@ mod tests {
     fn lp_to_writes(lp: &str) -> Partitioned<HashMap<String, MutableBatch>> {
         let (writes, _) = mutable_batch_lp::lines_to_batches_stats(lp, 42)
             .expect("failed to build test writes from LP");
-        Partitioned::new("key".to_owned(), writes)
+        Partitioned::new("key".into(), writes)
     }
 
     // Init a mock write buffer with the given number of sequencers.

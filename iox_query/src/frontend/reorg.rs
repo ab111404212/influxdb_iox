@@ -2,18 +2,14 @@
 
 use std::sync::Arc;
 
-use datafusion::logical_plan::{
-    col, lit_timestamp_nano, provider_as_source, Expr, LogicalPlan, LogicalPlanBuilder,
-};
+use datafusion::logical_plan::{col, lit_timestamp_nano, LogicalPlan};
 use observability_deps::tracing::debug;
 use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
 
-use crate::{
-    exec::make_stream_split,
-    provider::{ChunkTableProvider, ProviderBuilder},
-    QueryChunk,
-};
+use crate::{exec::make_stream_split, QueryChunk};
 use snafu::{ResultExt, Snafu};
+
+use super::common::ScanPlanBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -25,17 +21,28 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Reorg planner got error building scan: {}", source))]
+    BuildingScan {
+        source: crate::frontend::common::Error,
+    },
+
     #[snafu(display(
-        "Reorg planner got error adding chunk for table {}: {}",
+        "Reorg planner got error adding creating scan for {}: {}",
         table_name,
         source
     ))]
-    CreatingProvider {
+    CreatingScan {
         table_name: String,
-        source: crate::provider::Error,
+        source: super::common::Error,
     },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl From<datafusion::error::DataFusionError> for Error {
+    fn from(source: datafusion::error::DataFusionError) -> Self {
+        Self::BuildingPlan { source }
+    }
+}
 
 /// Planner for physically rearranging chunk data. This planner
 /// creates COMPACT and SPLIT plans for use in the database lifecycle manager
@@ -45,50 +52,6 @@ pub struct ReorgPlanner {}
 impl ReorgPlanner {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Creates an execution plan for a full scan of a single chunk.
-    /// This plan is primarilty used to load chunks from one storage medium to
-    /// another.
-    pub fn scan_single_chunk_plan(
-        &self,
-        schema: Arc<Schema>,
-        chunk: Arc<dyn QueryChunk>,
-    ) -> Result<LogicalPlan> {
-        self.scan_single_chunk_plan_with_filter(schema, chunk, None, vec![])
-    }
-
-    /// Creates an execution plan for a scan and filter data of a single chunk
-    pub fn scan_single_chunk_plan_with_filter(
-        &self,
-        schema: Arc<Schema>,
-        chunk: Arc<dyn QueryChunk>,
-        projection: Option<Vec<usize>>,
-        filters: Vec<Expr>,
-    ) -> Result<LogicalPlan> {
-        let table_name = chunk.table_name();
-        // Prepare the plan for the table
-        let mut builder = ProviderBuilder::new(table_name, schema);
-
-        // There are no predicates in these plans, so no need to prune them
-        builder = builder.add_no_op_pruner();
-        builder = builder.add_chunk(Arc::clone(&chunk));
-
-        let provider = builder
-            .build()
-            .context(CreatingProviderSnafu { table_name })?;
-
-        let source = provider_as_source(Arc::new(provider));
-
-        // Logical plan to scan given columns and apply predicates
-        let plan = LogicalPlanBuilder::scan_with_filters(table_name, source, projection, filters)
-            .context(BuildingPlanSnafu)?
-            .build()
-            .context(BuildingPlanSnafu)?;
-
-        debug!(%table_name, plan=%plan.display_indent_schema(),
-               "created single chunk scan plan");
-        Ok(plan)
     }
 
     /// Creates an execution plan for the COMPACT operations which does the following:
@@ -110,13 +73,15 @@ impl ReorgPlanner {
     where
         I: IntoIterator<Item = Arc<dyn QueryChunk>>,
     {
-        let ScanPlan {
-            plan_builder,
-            provider,
-        } = self.sorted_scan_plan(schema, chunks, sort_key)?;
-        let plan = plan_builder.build().context(BuildingPlanSnafu)?;
+        let scan_plan = ScanPlanBuilder::new(schema)
+            .with_chunks(chunks)
+            .with_sort_key(sort_key)
+            .build()
+            .context(BuildingScanSnafu)?;
 
-        debug!(table_name=provider.table_name(), plan=%plan.display_indent_schema(),
+        let plan = scan_plan.plan_builder.build()?;
+
+        debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
                "created compact plan for table");
 
         Ok(plan)
@@ -176,93 +141,28 @@ impl ReorgPlanner {
     where
         I: IntoIterator<Item = Arc<dyn QueryChunk>>,
     {
-        let ScanPlan {
-            plan_builder,
-            provider,
-        } = self.sorted_scan_plan(schema, chunks, sort_key)?;
+        let scan_plan = ScanPlanBuilder::new(schema)
+            .with_chunks(chunks)
+            .with_sort_key(sort_key)
+            .build()
+            .context(BuildingScanSnafu)?;
 
         // time <= split_time
         let split_expr = col(TIME_COLUMN_NAME).lt_eq(lit_timestamp_nano(split_time));
 
-        let plan = plan_builder.build().context(BuildingPlanSnafu)?;
+        let plan = scan_plan.plan_builder.build().context(BuildingPlanSnafu)?;
         let plan = make_stream_split(plan, split_expr);
 
-        debug!(table_name=provider.table_name(), plan=%plan.display_indent_schema(),
+        debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
                "created split plan for table");
 
         Ok(plan)
     }
-
-    /// Creates a scan plan for the given set of chunks.
-    ///
-    /// Output data of the scan will be deduplicated
-    /// Output of the data will be sorted on the given sort_key if provided
-    ///
-    /// Refer to query::provider::build_scan_plan for the detail of the plan
-    ///
-    fn sorted_scan_plan<I>(
-        &self,
-        schema: Arc<Schema>,
-        chunks: I,
-        sort_key: SortKey,
-    ) -> Result<ScanPlan>
-    where
-        I: IntoIterator<Item = Arc<dyn QueryChunk>>,
-    {
-        let mut chunks = chunks.into_iter().peekable();
-        let table_name = match chunks.peek() {
-            Some(chunk) => chunk.table_name().to_string(),
-            None => panic!("No chunks provided to compact plan"),
-        };
-        let table_name = &table_name;
-
-        // Prepare the plan for the table
-        let mut builder = ProviderBuilder::new(table_name, schema)
-            // There are no predicates in these plans, so no need to prune them
-            .add_no_op_pruner()
-            // Tell the scan of this provider to sort its output on the given sort_key
-            .with_sort_key(sort_key);
-
-        for chunk in chunks {
-            // check that it is consistent with this table_name
-            assert_eq!(
-                chunk.table_name(),
-                table_name,
-                "Chunk {} expected table mismatch",
-                chunk.id(),
-            );
-
-            builder = builder.add_chunk(chunk);
-        }
-
-        let provider = builder
-            .build()
-            .context(CreatingProviderSnafu { table_name })?;
-
-        let provider = Arc::new(provider);
-        let source = provider_as_source(Arc::clone(&provider) as _);
-
-        // Scan all columns
-        let projection = None;
-
-        let plan_builder =
-            LogicalPlanBuilder::scan(table_name, source, projection).context(BuildingPlanSnafu)?;
-
-        Ok(ScanPlan {
-            plan_builder,
-            provider,
-        })
-    }
-}
-
-struct ScanPlan {
-    plan_builder: LogicalPlanBuilder,
-    provider: Arc<ChunkTableProvider>,
 }
 
 #[cfg(test)]
 mod test {
-    use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
+    use arrow_util::assert_batches_eq;
     use datafusion_util::{test_collect, test_collect_partition};
     use schema::merge::SchemaMerger;
     use schema::sort::SortKeyBuilder;
@@ -331,45 +231,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_sorted_scan_plan() {
-        test_helpers::maybe_start_logging();
-
-        let (schema, chunks) = get_test_chunks().await;
-        let scan_plan = ReorgPlanner::new()
-            .scan_single_chunk_plan(schema, chunks.into_iter().next().unwrap())
-            .expect("created compact plan");
-
-        let executor = Executor::new(1);
-        let physical_plan = executor
-            .new_context(ExecutorType::Reorg)
-            .prepare_plan(&scan_plan)
-            .await
-            .unwrap();
-
-        // single chunk processed
-        assert_eq!(physical_plan.output_partitioning().partition_count(), 1);
-
-        let batches = test_collect(physical_plan).await;
-
-        // all data from chunk
-        let expected = vec![
-            "+-----------+------------+------+--------------------------------+",
-            "| field_int | field_int2 | tag1 | time                           |",
-            "+-----------+------------+------+--------------------------------+",
-            "| 100       |            | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 70        |            | CT   | 1970-01-01T00:00:00.000000100Z |",
-            "| 1000      |            | MT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 5         |            | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "| 10        |            | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "+-----------+------------+------+--------------------------------+",
-        ];
-
-        assert_batches_sorted_eq!(&expected, &batches);
-
-        executor.join().await;
-    }
-
-    #[tokio::test]
     async fn test_compact_plan() {
         test_helpers::maybe_start_logging();
 
@@ -387,7 +248,7 @@ mod test {
         let executor = Executor::new(1);
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
-            .prepare_plan(&compact_plan)
+            .create_physical_plan(&compact_plan)
             .await
             .unwrap();
         assert_eq!(
@@ -440,7 +301,7 @@ mod test {
         let executor = Executor::new(1);
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
-            .prepare_plan(&split_plan)
+            .create_physical_plan(&split_plan)
             .await
             .unwrap();
 

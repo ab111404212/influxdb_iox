@@ -1,4 +1,51 @@
-//! This module contains a DataFusion extension node to "split" schemas
+//! This module contains a DataFusion extension node to "split" a
+//! stream based on an expression.
+//!
+//! All rows for which the expression are true are sent to partition
+//! `0` and all other rows are sent to partition `1`.
+//!
+//! There are corresponding [`LogicalPlan`] ([`StreamSplitNode`]) and
+//! [`ExecutionPlan`] ([`StreamSplitExec`]) implementations, which are
+//! typically used as shown in the following diagram:
+//!
+//!
+//! ```text
+//!                                               partition 0            partition 1
+//!                                                   ▲                       ▲
+//!                                                   │                       │
+//!                                                   └────────────┬──────────┘
+//!                                                                │
+//!                                                                │
+//!                                                   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+//!                                                        StreamSplitExec     │
+//!                                                   │          expr
+//!                                                    ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+//!                                                                ▲
+//!                                                                │
+//!                                                   ┌────────────────────────┐
+//!                                                   │         Union          │
+//!                                                   │                        │
+//!                                                   └────────────────────────┘
+//!                                                                ▲
+//!                                                                │
+//!
+//!                                                       Other IOxScan code
+//!       ┌────────────────────────┐                     (Filter, Dedup, etc)
+//!       │ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │                             ...
+//!       │      StreamSplit     │ │
+//!       │ └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │                               ▲
+//!       │       Extension        │                               │
+//!       └────────────────────────┘                               │
+//!                    ▲                              ┌────────────────────────┐
+//!                    │                              │     TableProvider      │
+//!       ┌────────────────────────┐                  │                        │
+//!       │       TableScan        │                  └────────────────────────┘
+//!       │                        │
+//!       └────────────────────────┘
+//!
+//!                                                          Execution Plan
+//!             Logical Plan                                (Physical Plan)
+//! ```
 
 use std::{
     any::Any,
@@ -90,7 +137,7 @@ impl UserDefinedLogicalNode for StreamSplitNode {
         &self,
         exprs: &[Expr],
         inputs: &[LogicalPlan],
-    ) -> Arc<dyn UserDefinedLogicalNode + Send + Sync> {
+    ) -> Arc<dyn UserDefinedLogicalNode> {
         assert_eq!(inputs.len(), 1, "StreamSplitNode: input sizes inconistent");
         assert_eq!(
             exprs.len(),

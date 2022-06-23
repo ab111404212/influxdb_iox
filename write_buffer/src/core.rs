@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use data_types::SequenceNumber;
 use dml::{DmlMeta, DmlOperation, DmlWrite};
 use futures::stream::BoxStream;
 
@@ -161,7 +162,7 @@ pub trait WriteBufferWriting: Sync + Send + Debug + 'static {
 
         self.store_operation(
             sequencer_id,
-            &DmlOperation::Write(DmlWrite::new("test_db", tables, Default::default())),
+            &DmlOperation::Write(DmlWrite::new("test_db", tables, None, Default::default())),
         )
         .await
     }
@@ -201,7 +202,7 @@ pub trait WriteBufferStreamHandler: Sync + Send + Debug + 'static {
     /// due to "holes" in the stream).
     ///
     /// Note that due to the mutable borrow, it is not possible to seek while streams exists.
-    async fn seek(&mut self, sequence_number: u64) -> Result<(), WriteBufferError>;
+    async fn seek(&mut self, sequence_number: SequenceNumber) -> Result<(), WriteBufferError>;
 
     /// Reset the sequencer to whatever is the earliest number available in the retained write
     /// buffer. Useful to restart if [`WriteBufferErrorKind::UnknownSequenceNumber`] is returned
@@ -215,7 +216,7 @@ impl WriteBufferStreamHandler for Box<dyn WriteBufferStreamHandler> {
         self.as_mut().stream().await
     }
 
-    async fn seek(&mut self, sequence_number: u64) -> Result<(), WriteBufferError> {
+    async fn seek(&mut self, sequence_number: SequenceNumber) -> Result<(), WriteBufferError> {
         self.as_mut().seek(sequence_number).await
     }
 
@@ -258,7 +259,10 @@ pub trait WriteBufferReading: Sync + Send + Debug + 'static {
     /// Can be used to calculate lag. Note that since the watermark is "next sequence ID number to
     /// be added", it starts at 0 and after the entry with sequence number 0 is added to the
     /// buffer, it is 1.
-    async fn fetch_high_watermark(&self, sequencer_id: u32) -> Result<u64, WriteBufferError>;
+    async fn fetch_high_watermark(
+        &self,
+        sequencer_id: u32,
+    ) -> Result<SequenceNumber, WriteBufferError>;
 
     /// Return type (like `"mock"` or `"kafka"`) of this reader.
     fn type_name(&self) -> &'static str;
@@ -272,6 +276,7 @@ pub mod test_utils {
         WriteBufferError, WriteBufferReading, WriteBufferStreamHandler, WriteBufferWriting,
     };
     use async_trait::async_trait;
+    use data_types::{PartitionKey, SequenceNumber};
     use dml::{test_util::assert_write_op_eq, DmlMeta, DmlOperation, DmlWrite};
     use futures::{stream::FuturesUnordered, Stream, StreamExt, TryStreamExt};
     use iox_time::{Time, TimeProvider};
@@ -367,12 +372,14 @@ pub mod test_utils {
         writer: &impl WriteBufferWriting,
         lp: &str,
         sequencer_id: u32,
+        partition_key: PartitionKey,
         span_context: Option<&SpanContext>,
     ) -> DmlWrite {
         let tables = mutable_batch_lp::lines_to_batches(lp, 0).unwrap();
         let write = DmlWrite::new(
             namespace,
             tables,
+            Some(partition_key),
             DmlMeta::unsequenced(span_context.cloned()),
         );
         let operation = DmlOperation::Write(write);
@@ -419,15 +426,39 @@ pub mod test_utils {
         assert_stream_pending(&mut stream).await;
 
         // adding content allows us to get results
-        let w1 = write("namespace", &writer, entry_1, sequencer_id, None).await;
+        let w1 = write(
+            "namespace",
+            &writer,
+            entry_1,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w1);
 
         // stream is pending again
         assert_stream_pending(&mut stream).await;
 
         // adding more data unblocks the stream
-        let w2 = write("namespace", &writer, entry_2, sequencer_id, None).await;
-        let w3 = write("namespace", &writer, entry_3, sequencer_id, None).await;
+        let w2 = write(
+            "namespace",
+            &writer,
+            entry_2,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w3 = write(
+            "namespace",
+            &writer,
+            entry_3,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w2);
         assert_write_op_eq(&stream.next().await.unwrap().unwrap(), &w3);
@@ -455,9 +486,33 @@ pub mod test_utils {
         let writer = context.writing(true).await.unwrap();
         let reader = context.reading(true).await.unwrap();
 
-        let w1 = write("namespace", &writer, entry_1, 0, None).await;
-        let w2 = write("namespace", &writer, entry_2, 0, None).await;
-        let w3 = write("namespace", &writer, entry_3, 0, None).await;
+        let w1 = write(
+            "namespace",
+            &writer,
+            entry_1,
+            0,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w2 = write(
+            "namespace",
+            &writer,
+            entry_2,
+            0,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w3 = write(
+            "namespace",
+            &writer,
+            entry_3,
+            0,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         // creating stream, drop stream, re-create it => still starts at first entry
         let sequencer_id = set_pop_first(&mut reader.sequencer_ids()).unwrap();
@@ -524,15 +579,39 @@ pub mod test_utils {
         assert_stream_pending(&mut stream_2).await;
 
         // entries arrive at the right target stream
-        let w1 = write("namespace", &writer, entry_1, sequencer_id_1, None).await;
+        let w1 = write(
+            "namespace",
+            &writer,
+            entry_1,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         assert_write_op_eq(&stream_1.next().await.unwrap().unwrap(), &w1);
         assert_stream_pending(&mut stream_2).await;
 
-        let w2 = write("namespace", &writer, entry_2, sequencer_id_2, None).await;
+        let w2 = write(
+            "namespace",
+            &writer,
+            entry_2,
+            sequencer_id_2,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         assert_stream_pending(&mut stream_1).await;
         assert_write_op_eq(&stream_2.next().await.unwrap().unwrap(), &w2);
 
-        let w3 = write("namespace", &writer, entry_3, sequencer_id_1, None).await;
+        let w3 = write(
+            "namespace",
+            &writer,
+            entry_3,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         assert_stream_pending(&mut stream_2).await;
         assert_write_op_eq(&stream_1.next().await.unwrap().unwrap(), &w3);
 
@@ -571,9 +650,33 @@ pub mod test_utils {
         let sequencer_id_1 = set_pop_first(&mut sequencer_ids_1).unwrap();
         let sequencer_id_2 = set_pop_first(&mut sequencer_ids_1).unwrap();
 
-        let w_east_1 = write("namespace", &writer_1, entry_east_1, sequencer_id_1, None).await;
-        let w_west_1 = write("namespace", &writer_1, entry_west_1, sequencer_id_2, None).await;
-        let w_east_2 = write("namespace", &writer_2, entry_east_2, sequencer_id_1, None).await;
+        let w_east_1 = write(
+            "namespace",
+            &writer_1,
+            entry_east_1,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w_west_1 = write(
+            "namespace",
+            &writer_1,
+            entry_west_1,
+            sequencer_id_2,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w_east_2 = write(
+            "namespace",
+            &writer_2,
+            entry_east_2,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         let mut handler_1_1 = reader_1.stream_handler(sequencer_id_1).await.unwrap();
         let mut handler_1_2 = reader_1.stream_handler(sequencer_id_2).await.unwrap();
@@ -611,9 +714,33 @@ pub mod test_utils {
         let sequencer_id_1 = set_pop_first(&mut sequencer_ids).unwrap();
         let sequencer_id_2 = set_pop_first(&mut sequencer_ids).unwrap();
 
-        let w_east_1 = write("namespace", &writer, entry_east_1, sequencer_id_1, None).await;
-        let w_east_2 = write("namespace", &writer, entry_east_2, sequencer_id_1, None).await;
-        let w_west_1 = write("namespace", &writer, entry_west_1, sequencer_id_2, None).await;
+        let w_east_1 = write(
+            "namespace",
+            &writer,
+            entry_east_1,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w_east_2 = write(
+            "namespace",
+            &writer,
+            entry_east_2,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w_west_1 = write(
+            "namespace",
+            &writer,
+            entry_west_1,
+            sequencer_id_2,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         let reader_1 = context.reading(true).await.unwrap();
         let reader_2 = context.reading(true).await.unwrap();
@@ -639,14 +766,25 @@ pub mod test_utils {
         assert_reader_content(&mut handler_2_2, &[&w_west_1]).await;
 
         // backward seek
-        handler_1_1_a.seek(0).await.unwrap();
+        handler_1_1_a.seek(SequenceNumber::new(0)).await.unwrap();
         assert_reader_content(&mut handler_1_1_a, &[&w_east_1, &w_east_2]).await;
 
         // seek to far end and then add data
         // The affected stream should error and then stop. The other streams should still be
         // pending.
-        handler_1_1_a.seek(1_000_000).await.unwrap();
-        let w_east_3 = write("namespace", &writer, entry_east_3, 0, None).await;
+        handler_1_1_a
+            .seek(SequenceNumber::new(1_000_000))
+            .await
+            .unwrap();
+        let w_east_3 = write(
+            "namespace",
+            &writer,
+            entry_east_3,
+            0,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         let err = handler_1_1_a
             .stream()
@@ -665,7 +803,7 @@ pub mod test_utils {
         assert_stream_pending(&mut handler_2_2.stream().await).await;
 
         // seeking again should recover the stream
-        handler_1_1_a.seek(0).await.unwrap();
+        handler_1_1_a.seek(SequenceNumber::new(0)).await.unwrap();
         assert_reader_content(&mut handler_1_1_a, &[&w_east_1, &w_east_2, &w_east_3]).await;
     }
 
@@ -691,8 +829,24 @@ pub mod test_utils {
         let mut sequencer_ids = writer.sequencer_ids();
         let sequencer_id_1 = set_pop_first(&mut sequencer_ids).unwrap();
 
-        let w_east_1 = write("namespace", &writer, entry_east_1, sequencer_id_1, None).await;
-        let w_east_2 = write("namespace", &writer, entry_east_2, sequencer_id_1, None).await;
+        let w_east_1 = write(
+            "namespace",
+            &writer,
+            entry_east_1,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w_east_2 = write(
+            "namespace",
+            &writer,
+            entry_east_2,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         let reader_1 = context.reading(true).await.unwrap();
 
@@ -740,17 +894,41 @@ pub mod test_utils {
         // start at watermark 0
         assert_eq!(
             reader.fetch_high_watermark(sequencer_id_1).await.unwrap(),
-            0
+            SequenceNumber::new(0),
         );
         assert_eq!(
             reader.fetch_high_watermark(sequencer_id_2).await.unwrap(),
-            0
+            SequenceNumber::new(0)
         );
 
         // high water mark moves
-        write("namespace", &writer, entry_east_1, sequencer_id_1, None).await;
-        let w1 = write("namespace", &writer, entry_east_2, sequencer_id_1, None).await;
-        let w2 = write("namespace", &writer, entry_west_1, sequencer_id_2, None).await;
+        write(
+            "namespace",
+            &writer,
+            entry_east_1,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w1 = write(
+            "namespace",
+            &writer,
+            entry_east_2,
+            sequencer_id_1,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w2 = write(
+            "namespace",
+            &writer,
+            entry_west_1,
+            sequencer_id_2,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         assert_eq!(
             reader.fetch_high_watermark(sequencer_id_1).await.unwrap(),
             w1.meta().sequence().unwrap().sequence_number + 1
@@ -786,7 +964,15 @@ pub mod test_utils {
         assert_eq!(sequencer_ids.len(), 1);
         let sequencer_id = set_pop_first(&mut sequencer_ids).unwrap();
 
-        let write = write("namespace", &writer, entry, sequencer_id, None).await;
+        let write = write(
+            "namespace",
+            &writer,
+            entry,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
         let reported_ts = write.meta().producer_ts().unwrap();
 
         // advance time
@@ -876,7 +1062,15 @@ pub mod test_utils {
         let mut stream = handler.stream().await;
 
         // 1: no context
-        write("namespace", &writer, entry, sequencer_id, None).await;
+        write(
+            "namespace",
+            &writer,
+            entry,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         // check write 1
         let write_1 = stream.next().await.unwrap().unwrap();
@@ -893,6 +1087,7 @@ pub mod test_utils {
             &writer,
             entry,
             sequencer_id,
+            PartitionKey::from("bananas"),
             Some(&span_context_1),
         )
         .await;
@@ -905,6 +1100,7 @@ pub mod test_utils {
             &writer,
             entry,
             sequencer_id,
+            PartitionKey::from("bananas"),
             Some(&span_context_2),
         )
         .await;
@@ -931,7 +1127,7 @@ pub mod test_utils {
         let context = adapter.new_context(NonZeroU32::try_from(1).unwrap()).await;
 
         let tables = mutable_batch_lp::lines_to_batches("upc user=1 100", 0).unwrap();
-        let write = DmlWrite::new("foo", tables, Default::default());
+        let write = DmlWrite::new("foo", tables, None, Default::default());
         let operation = DmlOperation::Write(write);
 
         let writer = context.writing(true).await.unwrap();
@@ -966,8 +1162,24 @@ pub mod test_utils {
         assert_eq!(sequencer_ids.len(), 1);
         let sequencer_id = set_pop_first(&mut sequencer_ids).unwrap();
 
-        let w1 = write("namespace_1", &writer, entry_2, sequencer_id, None).await;
-        let w2 = write("namespace_2", &writer, entry_1, sequencer_id, None).await;
+        let w1 = write(
+            "namespace_1",
+            &writer,
+            entry_2,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
+        let w2 = write(
+            "namespace_2",
+            &writer,
+            entry_1,
+            sequencer_id,
+            PartitionKey::from("bananas"),
+            None,
+        )
+        .await;
 
         let mut handler = reader.stream_handler(sequencer_id).await.unwrap();
         assert_reader_content(&mut handler, &[&w1, &w2]).await;
@@ -993,7 +1205,15 @@ pub mod test_utils {
                 async move {
                     let entry = format!("upc,region=east user={} {}", i, i);
 
-                    write("ns", writer.as_ref(), &entry, sequencer_id, None).await;
+                    write(
+                        "ns",
+                        writer.as_ref(),
+                        &entry,
+                        sequencer_id,
+                        PartitionKey::from("bananas"),
+                        None,
+                    )
+                    .await;
                 }
             })
             .collect();
@@ -1125,9 +1345,14 @@ pub mod test_utils {
     /// If `TEST_INTEGRATION` is not set, skip the calling test by returning early.
     #[macro_export]
     macro_rules! maybe_skip_kafka_integration {
-        () => {{
+        () => {
+            maybe_skip_kafka_integration!("")
+        };
+        ($panic_msg:expr) => {{
             use std::env;
             dotenv::dotenv().ok();
+
+            let panic_msg: &'static str = $panic_msg;
 
             match (
                 env::var("TEST_INTEGRATION").is_ok(),
@@ -1148,14 +1373,22 @@ pub mod test_utils {
                 }
                 (false, Some(_)) => {
                     eprintln!("skipping Kafka integration tests - set TEST_INTEGRATION to run");
-                    return;
+                    if !panic_msg.is_empty() {
+                        panic!("{}", panic_msg);
+                    } else {
+                        return;
+                    }
                 }
                 (false, None) => {
                     eprintln!(
                         "skipping Kafka integration tests - set TEST_INTEGRATION and KAFKA_CONNECT \
                         to run"
                     );
-                    return;
+                    if !panic_msg.is_empty() {
+                        panic!("{}", panic_msg);
+                    } else {
+                        return;
+                    }
                 }
             }
         }};

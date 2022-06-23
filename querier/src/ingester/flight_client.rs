@@ -1,18 +1,15 @@
-use arrow::{datatypes::Schema, record_batch::RecordBatch};
 use async_trait::async_trait;
 use client_util::connection::{self, Connection};
 use generated_types::ingester::IngesterQueryRequest;
-use influxdb_iox_client::flight::{self, generated_types::IngesterQueryResponseMetadata};
+use influxdb_iox_client::flight::{
+    generated_types as proto,
+    low_level::{Client as LowLevelFlightClient, LowLevelMessage, PerformQuery},
+};
 use observability_deps::tracing::debug;
 use snafu::{ResultExt, Snafu};
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt::Debug, ops::DerefMut, sync::Arc};
 
-pub use flight::{Error as FlightError, PerformQuery};
+pub use influxdb_iox_client::flight::Error as FlightError;
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
@@ -96,11 +93,10 @@ impl FlightClient for FlightClientImpl {
     ) -> Result<Box<dyn QueryData>, Error> {
         let connection = self.connect(Arc::clone(&ingester_addr)).await?;
 
-        let mut client =
-            flight::Client::<flight::generated_types::IngesterQueryRequest>::new(connection);
+        let mut client = LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection);
 
         debug!(%ingester_addr, ?request, "Sending request to ingester");
-        let request: flight::generated_types::IngesterQueryRequest =
+        let request: proto::IngesterQueryRequest =
             request.try_into().context(CreatingRequestSnafu)?;
 
         let perform_query = client.perform_query(request).await.context(FlightSnafu)?;
@@ -113,15 +109,11 @@ impl FlightClient for FlightClientImpl {
 /// This is mostly the same as [`PerformQuery`] but allows some easier mocking.
 #[async_trait]
 pub trait QueryData: Debug + Send + 'static {
-    /// Returns the next `RecordBatch` available for this query, or `None` if
+    /// Returns the next [`LowLevelMessage`] available for this query, or `None` if
     /// there are no further results available.
-    async fn next(&mut self) -> Result<Option<RecordBatch>, FlightError>;
-
-    /// App metadata that was part of the response.
-    fn app_metadata(&self) -> &IngesterQueryResponseMetadata;
-
-    /// Schema.
-    fn schema(&self) -> Arc<Schema>;
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(LowLevelMessage, proto::IngesterQueryResponseMetadata)>, FlightError>;
 }
 
 #[async_trait]
@@ -129,31 +121,19 @@ impl<T> QueryData for Box<T>
 where
     T: QueryData + ?Sized,
 {
-    async fn next(&mut self) -> Result<Option<RecordBatch>, FlightError> {
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(LowLevelMessage, proto::IngesterQueryResponseMetadata)>, FlightError> {
         self.deref_mut().next().await
-    }
-
-    fn app_metadata(&self) -> &IngesterQueryResponseMetadata {
-        self.deref().app_metadata()
-    }
-
-    fn schema(&self) -> Arc<Schema> {
-        self.deref().schema()
     }
 }
 
 #[async_trait]
-impl QueryData for PerformQuery<IngesterQueryResponseMetadata> {
-    async fn next(&mut self) -> Result<Option<RecordBatch>, FlightError> {
+impl QueryData for PerformQuery<proto::IngesterQueryResponseMetadata> {
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(LowLevelMessage, proto::IngesterQueryResponseMetadata)>, FlightError> {
         self.next().await
-    }
-
-    fn app_metadata(&self) -> &IngesterQueryResponseMetadata {
-        self.app_metadata()
-    }
-
-    fn schema(&self) -> Arc<Schema> {
-        self.schema()
     }
 }
 
@@ -191,9 +171,8 @@ impl CachedConnection {
                 .context(ConnectingSnafu { ingester_address })?;
 
             // sanity check w/ a handshake
-            let mut client = flight::Client::<flight::generated_types::IngesterQueryRequest>::new(
-                connection.clone(),
-            );
+            let mut client =
+                LowLevelFlightClient::<proto::IngesterQueryRequest>::new(connection.clone());
 
             // make contact with the ingester
             client

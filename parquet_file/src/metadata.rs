@@ -86,9 +86,10 @@
 //! [Apache Parquet]: https://parquet.apache.org/
 //! [Apache Thrift]: https://thrift.apache.org/
 //! [Thrift Compact Protocol]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md
+use bytes::Bytes;
 use data_types::{
-    ColumnSummary, InfluxDbType, NamespaceId, ParquetFileParams, PartitionId, SequenceNumber,
-    SequencerId, StatValues, Statistics, TableId, Timestamp,
+    ColumnSet, ColumnSummary, InfluxDbType, NamespaceId, ParquetFileParams, PartitionId,
+    PartitionKey, SequenceNumber, SequencerId, StatValues, Statistics, TableId, Timestamp,
 };
 use generated_types::influxdata::iox::ingester::v1 as proto;
 use iox_time::Time;
@@ -101,7 +102,7 @@ use parquet::{
             RowGroupMetaData as ParquetRowGroupMetaData,
         },
         reader::FileReader,
-        serialized_reader::{SerializedFileReader, SliceableCursor},
+        serialized_reader::SerializedFileReader,
         statistics::Statistics as ParquetStatistics,
     },
     schema::types::SchemaDescriptor as ParquetSchemaDescriptor,
@@ -264,7 +265,7 @@ pub struct IoxMetadata {
     pub partition_id: PartitionId,
 
     /// parittion key of the data
-    pub partition_key: Arc<str>,
+    pub partition_key: PartitionKey,
 
     /// sequence number of the first write
     pub min_sequence_number: SequenceNumber,
@@ -329,7 +330,7 @@ impl IoxMetadata {
         // extract strings
         let namespace_name = Arc::from(proto_msg.namespace_name.as_ref());
         let table_name = Arc::from(proto_msg.table_name.as_ref());
-        let partition_key = Arc::from(proto_msg.partition_key.as_ref());
+        let partition_key = PartitionKey::from(proto_msg.partition_key);
 
         // sort key
         let sort_key = proto_msg.sort_key.map(|proto_key| {
@@ -405,9 +406,11 @@ impl IoxMetadata {
         let schema = decoded
             .read_schema()
             .expect("failed to read encoded schema");
-        let time_summary = decoded
+        let stats = decoded
             .read_statistics(&*schema)
-            .expect("invalid statistics")
+            .expect("invalid statistics");
+        let columns: Vec<String> = stats.iter().map(|v| v.name.clone()).collect();
+        let time_summary = stats
             .into_iter()
             .find(|v| v.name == TIME_COLUMN_NAME)
             .expect("no time column in metadata statistics");
@@ -440,6 +443,7 @@ impl IoxMetadata {
             compaction_level: self.compaction_level,
             row_count: row_count.try_into().expect("row count overflows i64"),
             created_at: Timestamp::new(self.creation_timestamp.timestamp_nanos()),
+            column_set: ColumnSet::new(columns),
         }
     }
 
@@ -449,7 +453,7 @@ impl IoxMetadata {
         let size_without_sortkey_refs = mem::size_of_val(self)
             + self.namespace_name.as_bytes().len()
             + self.table_name.as_bytes().len()
-            + self.partition_key.as_bytes().len();
+            + std::mem::size_of::<PartitionKey>();
 
         if let Some(sort_key) = self.sort_key.as_ref() {
             size_without_sortkey_refs +
@@ -511,13 +515,12 @@ impl Debug for IoxParquetMetaData {
 
 impl IoxParquetMetaData {
     /// Read parquet metadata from a parquet file.
-    pub fn from_file_bytes(data: Arc<Vec<u8>>) -> Result<Option<Self>> {
+    pub fn from_file_bytes(data: Bytes) -> Result<Option<Self>> {
         if data.is_empty() {
             return Ok(None);
         }
 
-        let cursor = SliceableCursor::new(data);
-        let reader = SerializedFileReader::new(cursor).context(ParquetMetaDataReadSnafu {})?;
+        let reader = SerializedFileReader::new(data).context(ParquetMetaDataReadSnafu {})?;
         let parquet_md = reader.metadata().clone();
 
         let data = Self::parquet_md_to_thrift(parquet_md)?;
@@ -957,7 +960,7 @@ mod tests {
             table_id: TableId::new(3),
             table_name: Arc::from("weather"),
             partition_id: PartitionId::new(4),
-            partition_key: Arc::from("part"),
+            partition_key: PartitionKey::from("part"),
             min_sequence_number: SequenceNumber::new(5),
             max_sequence_number: SequenceNumber::new(6),
             compaction_level: 0,
@@ -1018,7 +1021,7 @@ mod tests {
         // Read the metadata from the file bytes.
         //
         // This is quite wordy...
-        let iox_parquet_meta = IoxParquetMetaData::from_file_bytes(Arc::new(bytes))
+        let iox_parquet_meta = IoxParquetMetaData::from_file_bytes(Bytes::from(bytes))
             .expect("should decode")
             .expect("should contain metadata");
 

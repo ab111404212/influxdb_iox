@@ -4,7 +4,7 @@ use bytes::Bytes;
 use clap_blocks::object_store::{make_object_store, ObjectStoreType};
 use clap_blocks::{catalog_dsn::CatalogDsnConfig, object_store::ObjectStoreConfig};
 use data_types::{
-    ColumnType, KafkaPartition, NamespaceId, NamespaceSchema as CatalogNamespaceSchema,
+    ColumnSet, ColumnType, KafkaPartition, NamespaceId, NamespaceSchema as CatalogNamespaceSchema,
     ParquetFile as CatalogParquetFile, ParquetFileParams, PartitionId, SequenceNumber, SequencerId,
     TableId, Timestamp,
 };
@@ -73,6 +73,7 @@ pub struct Config {
 #[derive(Debug, clap::Parser)]
 struct Show {
     /// The id of the partition
+    #[clap(action)]
     id: i64,
 }
 
@@ -86,12 +87,15 @@ struct Pull {
     object_store: ObjectStoreConfig,
 
     /// The namespace we're getting the partition from
+    #[clap(action)]
     namespace: String,
 
     /// The table name
+    #[clap(action)]
     table: String,
 
     /// The partition key
+    #[clap(action)]
     partition_key: String,
 }
 
@@ -316,7 +320,7 @@ async fn load_partition(
         .expect("table should have been loaded");
     let partition = repos
         .partitions()
-        .create_or_get(&remote_partition.key, sequencer.id, table.id)
+        .create_or_get(remote_partition.key.clone().into(), sequencer.id, table.id)
         .await?;
 
     Ok(PartitionMapping {
@@ -360,6 +364,7 @@ async fn load_parquet_files(
                     row_count: p.row_count,
                     compaction_level: p.compaction_level as i16,
                     created_at: Timestamp::new(p.created_at),
+                    column_set: ColumnSet::new(p.column_set),
                 };
 
                 repos.parquet_files().create(params).await?
@@ -538,7 +543,7 @@ mod tests {
                 .unwrap();
             partition = repos
                 .partitions()
-                .create_or_get("1970-01-01", sequencer.id, table.id)
+                .create_or_get("1970-01-01".into(), sequencer.id, table.id)
                 .await
                 .unwrap();
         }
@@ -579,6 +584,7 @@ mod tests {
                 row_count,
                 compaction_level: 0,
                 created_at: created_at.get(),
+                column_set: vec!["col1".into(), "col2".into()],
             }],
         )
         .await
@@ -603,6 +609,7 @@ mod tests {
             row_count,
             compaction_level: 0,
             created_at,
+            column_set: ColumnSet::new(["col1", "col2"]),
         }];
         assert_eq!(expected, files);
     }

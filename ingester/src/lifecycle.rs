@@ -189,7 +189,7 @@ impl LifecycleState {
 
 /// A snapshot of the stats for the lifecycle manager
 #[derive(Debug)]
-pub struct LifecycleStats {
+struct LifecycleStats {
     /// total number of bytes the lifecycle manager is aware of across all sequencers and
     /// partitions. Based on the mutable batch sizes received into all partitions.
     pub total_bytes: usize,
@@ -199,7 +199,7 @@ pub struct LifecycleStats {
 
 /// The stats for a partition
 #[derive(Debug, Clone, Copy)]
-pub struct PartitionLifecycleStats {
+struct PartitionLifecycleStats {
     /// The sequencer this partition is under
     sequencer_id: SequencerId,
     /// The partition identifier
@@ -296,6 +296,11 @@ impl LifecycleManager {
             let sized_out = s.bytes_written > self.config.partition_size_threshold;
             if sized_out {
                 self.persist_size_counter.inc(1);
+                info!(sequencer_id=%s.sequencer_id,
+                      partition_id=%s.partition_id,
+                      bytes_written=s.bytes_written,
+                      partition_size_threshold=self.config.partition_size_threshold,
+                      "Partition is over size threshold, persisting");
             }
 
             aged_out || sized_out || is_cold
@@ -396,7 +401,7 @@ impl LifecycleManager {
     }
 
     /// Returns a point in time snapshot of the lifecycle state.
-    pub fn stats(&self) -> LifecycleStats {
+    fn stats(&self) -> LifecycleStats {
         let s = self.state.lock();
         let partition_stats: Vec<_> = s.partition_stats.values().cloned().collect();
 
@@ -407,7 +412,7 @@ impl LifecycleManager {
     }
 
     /// Removes the partition from the state
-    pub fn remove(&self, partition_id: PartitionId) -> Option<PartitionLifecycleStats> {
+    fn remove(&self, partition_id: PartitionId) -> Option<PartitionLifecycleStats> {
         let mut s = self.state.lock();
         s.remove(&partition_id)
     }

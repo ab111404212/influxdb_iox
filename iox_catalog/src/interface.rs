@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use data_types::{
     Column, ColumnSchema, ColumnType, KafkaPartition, KafkaTopic, KafkaTopicId, Namespace,
     NamespaceId, NamespaceSchema, ParquetFile, ParquetFileId, ParquetFileParams,
-    ParquetFileWithMetadata, Partition, PartitionId, PartitionInfo, ProcessedTombstone, QueryPool,
-    QueryPoolId, SequenceNumber, Sequencer, SequencerId, Table, TableId, TablePartition,
-    TableSchema, Timestamp, Tombstone, TombstoneId,
+    ParquetFileWithMetadata, Partition, PartitionId, PartitionInfo, PartitionKey,
+    ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Sequencer, SequencerId, Table,
+    TableId, TablePartition, TableSchema, Timestamp, Tombstone, TombstoneId,
 };
 use iox_time::TimeProvider;
 use snafu::{OptionExt, Snafu};
@@ -405,7 +405,7 @@ pub trait PartitionRepo: Send + Sync {
     /// create or get a partition record for the given partition key, sequencer and table
     async fn create_or_get(
         &mut self,
-        key: &str,
+        key: PartitionKey,
         sequencer_id: SequencerId,
         table_id: TableId,
     ) -> Result<Partition>;
@@ -433,7 +433,7 @@ pub trait PartitionRepo: Send + Sync {
     async fn update_sort_key(
         &mut self,
         partition_id: PartitionId,
-        sort_key: &str,
+        sort_key: &[&str],
     ) -> Result<Partition>;
 }
 
@@ -773,8 +773,8 @@ pub(crate) mod test_helpers {
 
     use super::*;
     use ::test_helpers::{assert_contains, tracing::TracingCapture};
-    use data_types::ColumnId;
-    use metric::{Attributes, Metric, U64Histogram};
+    use data_types::{ColumnId, ColumnSet};
+    use metric::{Attributes, DurationHistogram, Metric};
     use std::{
         ops::{Add, DerefMut},
         sync::Arc,
@@ -1265,7 +1265,10 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert_eq!(updated_sequencer.id, sequencer.id);
-        assert_eq!(updated_sequencer.min_unpersisted_sequence_number, 53);
+        assert_eq!(
+            updated_sequencer.min_unpersisted_sequence_number,
+            SequenceNumber::new(53)
+        );
 
         let sequencer = repos
             .sequencers()
@@ -1304,14 +1307,14 @@ pub(crate) mod test_helpers {
         for key in ["foo", "bar"] {
             let partition = repos
                 .partitions()
-                .create_or_get(key, sequencer.id, table.id)
+                .create_or_get(key.into(), sequencer.id, table.id)
                 .await
                 .expect("failed to create partition");
             created.insert(partition.id, partition);
         }
         let other_partition = repos
             .partitions()
-            .create_or_get("asdf", other_sequencer.id, table.id)
+            .create_or_get("asdf".into(), other_sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -1380,7 +1383,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         repos
             .partitions()
-            .create_or_get("some_key", sequencer.id, table2.id)
+            .create_or_get("some_key".into(), sequencer.id, table2.id)
             .await
             .expect("failed to create partition");
         let listed = repos
@@ -1401,29 +1404,13 @@ pub(crate) mod test_helpers {
             .collect();
         assert_eq!(expected, listed);
 
-        // sort_key should be None on creation
-        assert_eq!(other_partition.sort_key, None);
+        // sort_key should be empty on creation
+        assert!(other_partition.sort_key.is_empty());
 
         // test update_sort_key from None to Some
         repos
             .partitions()
-            .update_sort_key(other_partition.id, "tag2,tag1,time")
-            .await
-            .unwrap();
-
-        // test getting the new sort key
-        let updated_other_partition = repos
-            .partitions()
-            .get_by_id(other_partition.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated_other_partition.sort_key.unwrap(), "tag2,tag1,time");
-
-        // test update_sort_key from Some value to Some other value
-        repos
-            .partitions()
-            .update_sort_key(other_partition.id, "tag2,tag1,tag3,time")
+            .update_sort_key(other_partition.id, &["tag2", "tag1", "time"])
             .await
             .unwrap();
 
@@ -1435,8 +1422,30 @@ pub(crate) mod test_helpers {
             .unwrap()
             .unwrap();
         assert_eq!(
-            updated_other_partition.sort_key.unwrap(),
-            "tag2,tag1,tag3,time"
+            updated_other_partition.sort_key,
+            vec!["tag2", "tag1", "time"]
+        );
+
+        // test update_sort_key from Some value to Some other value
+        repos
+            .partitions()
+            .update_sort_key(
+                other_partition.id,
+                &["tag2", "tag1", "tag3 , with comma", "time"],
+            )
+            .await
+            .unwrap();
+
+        // test getting the new sort key
+        let updated_other_partition = repos
+            .partitions()
+            .get_by_id(other_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_other_partition.sort_key,
+            vec!["tag2", "tag1", "tag3 , with comma", "time"]
         );
     }
 
@@ -1639,7 +1648,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -1662,6 +1671,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let parquet_file = repos
             .parquet_files()
@@ -1849,12 +1859,12 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let other_partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, other_table.id)
+            .create_or_get("one".into(), sequencer.id, other_table.id)
             .await
             .unwrap();
 
@@ -1873,6 +1883,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let parquet_file = repos
             .parquet_files()
@@ -1927,13 +1938,13 @@ pub(crate) mod test_helpers {
             .list_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(1))
             .await
             .unwrap();
-        assert_eq!(vec![parquet_file, other_file], files);
+        assert_eq!(vec![parquet_file.clone(), other_file.clone()], files);
         let files = repos
             .parquet_files()
             .list_by_sequencer_greater_than(sequencer.id, SequenceNumber::new(150))
             .await
             .unwrap();
-        assert_eq!(vec![other_file], files);
+        assert_eq!(vec![other_file.clone()], files);
 
         // verify that to_delete is initially set to null and the file does not get deleted
         assert!(parquet_file.to_delete.is_none());
@@ -1988,7 +1999,7 @@ pub(crate) mod test_helpers {
             .list_by_table_not_to_delete(other_table.id)
             .await
             .unwrap();
-        assert_eq!(files, vec![other_file]);
+        assert_eq!(files, vec![other_file.clone()]);
 
         // test list_by_table_not_to_delete_with_metadata
         let files = repos
@@ -2020,7 +2031,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("foo", sequencer.id, table2.id)
+            .create_or_get("foo".into(), sequencer.id, table2.id)
             .await
             .unwrap();
         let files = repos
@@ -2064,7 +2075,7 @@ pub(crate) mod test_helpers {
             .list_by_namespace_not_to_delete(namespace2.id)
             .await
             .unwrap();
-        assert_eq!(vec![f1, f2], files);
+        assert_eq!(vec![f1.clone(), f2.clone()], files);
 
         let f3_params = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
@@ -2080,7 +2091,7 @@ pub(crate) mod test_helpers {
             .list_by_namespace_not_to_delete(namespace2.id)
             .await
             .unwrap();
-        assert_eq!(vec![f1, f2, f3], files);
+        assert_eq!(vec![f1.clone(), f2.clone(), f3.clone()], files);
 
         repos.parquet_files().flag_for_delete(f2.id).await.unwrap();
         let files = repos
@@ -2211,7 +2222,7 @@ pub(crate) mod test_helpers {
 
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2233,6 +2244,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
 
         let parquet_file = repos
@@ -2334,12 +2346,12 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let other_partition = repos
             .partitions()
-            .create_or_get("two", sequencer.id, table.id)
+            .create_or_get("two".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2363,6 +2375,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let parquet_file = repos
             .parquet_files()
@@ -2542,12 +2555,12 @@ pub(crate) mod test_helpers {
 
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("two", sequencer.id, table.id)
+            .create_or_get("two".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2569,6 +2582,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
 
         let parquet_file = repos
@@ -2622,7 +2636,7 @@ pub(crate) mod test_helpers {
             .list_by_partition_not_to_delete(partition.id)
             .await
             .unwrap();
-        assert_eq!(files, vec![parquet_file, level1_file]);
+        assert_eq!(files, vec![parquet_file.clone(), level1_file.clone()]);
 
         let files = repos
             .parquet_files()
@@ -2664,7 +2678,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2688,6 +2702,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let parquet_file = repos
             .parquet_files()
@@ -2706,7 +2721,7 @@ pub(crate) mod test_helpers {
         let nonexistent_parquet_file_id = ParquetFileId::new(level_0_file.id.get() + 1);
 
         // Level 0 parquet files should contain both existing files at this point
-        let expected = vec![parquet_file, level_0_file];
+        let expected = vec![parquet_file.clone(), level_0_file.clone()];
         let level_0 = repos.parquet_files().level_0(sequencer.id).await.unwrap();
         let mut level_0_ids: Vec<_> = level_0.iter().map(|pf| pf.id).collect();
         level_0_ids.sort();
@@ -2785,7 +2800,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2805,6 +2820,7 @@ pub(crate) mod test_helpers {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL,
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let p1 = repos
             .parquet_files()
@@ -3075,13 +3091,13 @@ pub(crate) mod test_helpers {
 
     fn assert_metric_hit(metrics: &metric::Registry, name: &'static str) {
         let histogram = metrics
-            .get_instrument::<Metric<U64Histogram>>("catalog_op_duration_ms")
+            .get_instrument::<Metric<DurationHistogram>>("catalog_op_duration")
             .expect("failed to read metric")
             .get_observer(&Attributes::from(&[("op", name), ("result", "success")]))
             .expect("failed to get observer")
             .fetch();
 
-        let hit_count = histogram.buckets.iter().fold(0, |acc, v| acc + v.count);
+        let hit_count = histogram.sample_count();
         assert!(hit_count > 1, "metric did not record any calls");
     }
 }

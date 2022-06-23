@@ -1,7 +1,6 @@
 //! This module is responsible for compacting Ingester's data
 
 use crate::data::{PersistingBatch, QueryableBatch};
-use arrow::record_batch::RecordBatch;
 use data_types::{NamespaceId, PartitionInfo};
 use datafusion::{error::DataFusionError, physical_plan::SendableRecordBatchStream};
 use iox_catalog::interface::INITIAL_COMPACTION_LEVEL;
@@ -30,9 +29,6 @@ pub enum Error {
     #[snafu(display("Error while executing Ingester's compaction"))]
     ExecutePlan { source: DataFusionError },
 
-    #[snafu(display("Error while collecting Ingester's compaction data into a Record Batch"))]
-    CollectStream { source: DataFusionError },
-
     #[snafu(display("Error while building delete predicate from start time, {}, stop time, {}, and serialized predicate, {}", min, max, predicate))]
     DeletePredicate {
         source: predicate::delete_predicate::Error,
@@ -51,15 +47,17 @@ pub enum Error {
 /// A specialized `Error` for Ingester's Compact errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Compact a given persisting batch
-/// Return compacted data with its metadata
+/// Compact a given persisting batch, returning a stream of compacted
+/// [`RecordBatch`] and the associated [`IoxMetadata`].
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
 pub async fn compact_persisting_batch(
     time_provider: Arc<dyn TimeProvider>,
     executor: &Executor,
     namespace_id: i64,
     partition_info: &PartitionInfo,
     batch: Arc<PersistingBatch>,
-) -> Result<Option<(Vec<RecordBatch>, IoxMetadata, Option<SortKey>)>> {
+) -> Result<Option<(SendableRecordBatchStream, IoxMetadata, Option<SortKey>)>> {
     // Nothing to compact
     if batch.data.data.is_empty() {
         return Ok(None);
@@ -93,16 +91,6 @@ pub async fn compact_persisting_batch(
 
     // Compact
     let stream = compact(executor, Arc::clone(&batch.data), metadata_sort_key.clone()).await?;
-    // Collect compacted data into record batches for computing statistics
-    let output_batches = datafusion::physical_plan::common::collect(stream)
-        .await
-        .context(CollectStreamSnafu {})?;
-
-    // Filter empty record batches
-    let output_batches: Vec<_> = output_batches
-        .into_iter()
-        .filter(|b| b.num_rows() != 0)
-        .collect();
 
     // Compute min and max sequence numbers
     let (min_seq, max_seq) = batch.data.min_max_sequence_numbers();
@@ -116,14 +104,14 @@ pub async fn compact_persisting_batch(
         table_id: batch.table_id,
         table_name: Arc::from(table_name.as_str()),
         partition_id: batch.partition_id,
-        partition_key: Arc::from(partition_key.as_str()),
+        partition_key: partition_key.clone(),
         min_sequence_number: min_seq,
         max_sequence_number: max_seq,
         compaction_level: INITIAL_COMPACTION_LEVEL,
         sort_key: Some(metadata_sort_key),
     };
 
-    Ok(Some((output_batches, meta, sort_key_update)))
+    Ok(Some((stream, meta, sort_key_update)))
 }
 
 /// Compact a given Queryable Batch
@@ -140,7 +128,7 @@ pub async fn compact(
 
     // Build physical plan
     let physical_plan = ctx
-        .prepare_plan(&logical_plan)
+        .create_physical_plan(&logical_plan)
         .await
         .context(PhysicalPlanSnafu {})?;
 
@@ -223,15 +211,19 @@ mod tests {
                 sequencer_id: SequencerId::new(seq_id),
                 table_id: TableId::new(table_id),
                 partition_key: partition_key.into(),
-                sort_key: None,
+                sort_key: vec![],
             },
         };
 
-        let (output_batches, _, _) =
+        let (stream, _, _) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on tag1 & time
@@ -289,15 +281,19 @@ mod tests {
                 sequencer_id: SequencerId::new(seq_id),
                 table_id: TableId::new(table_id),
                 partition_key: partition_key.into(),
-                sort_key: None,
+                sort_key: vec![],
             },
         };
 
-        let (output_batches, meta, sort_key_update) =
+        let (stream, meta, sort_key_update) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on tag1 & time
@@ -380,15 +376,19 @@ mod tests {
                 table_id: TableId::new(table_id),
                 partition_key: partition_key.into(),
                 // NO SORT KEY from the catalog here, first persisting batch
-                sort_key: None,
+                sort_key: vec![],
             },
         };
 
-        let (output_batches, meta, sort_key_update) =
+        let (stream, meta, sort_key_update) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on the computed sort key of tag1, tag3, & time
@@ -474,15 +474,19 @@ mod tests {
                 partition_key: partition_key.into(),
                 // SPECIFY A SORT KEY HERE to simulate a sort key being stored in the catalog
                 // this is NOT what the computed sort key would be based on this data's cardinality
-                sort_key: Some("tag3,tag1,time".into()),
+                sort_key: vec!["tag3".to_string(), "tag1".to_string(), "time".to_string()],
             },
         };
 
-        let (output_batches, meta, sort_key_update) =
+        let (stream, meta, sort_key_update) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on the specified sort key of tag3, tag1, &
@@ -569,15 +573,19 @@ mod tests {
                 // SPECIFY A SORT KEY HERE to simulate a sort key being stored in the catalog
                 // this is NOT what the computed sort key would be based on this data's cardinality
                 // The new column, tag1, should get added just before the time column
-                sort_key: Some("tag3,time".into()),
+                sort_key: vec!["tag3".to_string(), "time".to_string()],
             },
         };
 
-        let (output_batches, meta, sort_key_update) =
+        let (stream, meta, sort_key_update) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on the specified sort key of tag3, tag1, &
@@ -667,15 +675,24 @@ mod tests {
                 // SPECIFY A SORT KEY HERE to simulate a sort key being stored in the catalog
                 // this is NOT what the computed sort key would be based on this data's cardinality
                 // This contains a sort key, "tag4", that doesn't appear in the data.
-                sort_key: Some("tag3,tag1,tag4,time".into()),
+                sort_key: vec![
+                    "tag3".to_string(),
+                    "tag1".to_string(),
+                    "tag4".to_string(),
+                    "time".to_string(),
+                ],
             },
         };
 
-        let (output_batches, meta, sort_key_update) =
+        let (stream, meta, sort_key_update) =
             compact_persisting_batch(time_provider, &exc, 1, &partition_info, persisting_batch)
                 .await
                 .unwrap()
                 .unwrap();
+
+        let output_batches = datafusion::physical_plan::common::collect(stream)
+            .await
+            .expect("should execute plan");
 
         // verify compacted data
         // should be the same as the input but sorted on the specified sort key of tag3, tag1, &

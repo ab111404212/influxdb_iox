@@ -23,7 +23,7 @@ use iox_query::{
     QueryChunk,
 };
 use iox_time::TimeProvider;
-use metric::{Attributes, Metric, U64Counter, U64Gauge, U64Histogram, U64HistogramOptions};
+use metric::{Attributes, DurationHistogram, Metric, U64Counter, U64Gauge};
 use observability_deps::tracing::{debug, info, trace, warn};
 use parquet_file::{metadata::IoxMetadata, storage::ParquetStorage};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
@@ -191,7 +191,7 @@ pub struct Compactor {
     compaction_candidate_bytes_gauge: Metric<U64Gauge>,
 
     /// Histogram for tracking the time to compact a partition
-    compaction_duration_ms: Metric<U64Histogram>,
+    compaction_duration: Metric<DurationHistogram>,
 }
 
 impl Compactor {
@@ -230,14 +230,9 @@ impl Compactor {
             "Counter for level promotion from 0 to 1",
         );
 
-        // buckets for timing compact partition
-        let compaction_duration_buckets_ms =
-            || U64HistogramOptions::new([100, 1000, 5000, 10000, 30000, 60000, 360000, u64::MAX]);
-
-        let compaction_duration_ms: Metric<U64Histogram> = registry.register_metric_with_options(
-            "compactor_compact_partition_duration_ms",
-            "Compact partition duration in milliseconds",
-            compaction_duration_buckets_ms,
+        let compaction_duration: Metric<DurationHistogram> = registry.register_metric(
+            "compactor_compact_partition_duration",
+            "Compact partition duration",
         );
 
         Self {
@@ -254,7 +249,7 @@ impl Compactor {
             level_promotion_counter,
             compaction_candidate_gauge,
             compaction_candidate_bytes_gauge,
-            compaction_duration_ms,
+            compaction_duration,
         }
     }
 
@@ -545,8 +540,8 @@ impl Compactor {
         }
 
         if let Some(delta) = self.time_provider.now().checked_duration_since(start_time) {
-            let duration_ms = self.compaction_duration_ms.recorder(attributes.clone());
-            duration_ms.record(delta.as_millis() as _);
+            let duration = self.compaction_duration.recorder(attributes.clone());
+            duration.record(delta);
         }
 
         let compaction_counter = self.compaction_counter.recorder(attributes.clone());
@@ -749,7 +744,7 @@ impl Compactor {
 
         let ctx = self.exec.new_context(ExecutorType::Reorg);
         let physical_plan = ctx
-            .prepare_plan(&plan)
+            .create_physical_plan(&plan)
             .await
             .context(CompactPhysicalPlanSnafu)?;
 
@@ -776,7 +771,7 @@ impl Compactor {
                 table_id: iox_metadata.table_id,
                 table_name: Arc::<str>::clone(&iox_metadata.table_name),
                 partition_id: iox_metadata.partition_id,
-                partition_key: Arc::<str>::clone(&iox_metadata.partition_key),
+                partition_key: iox_metadata.partition_key.clone(),
                 min_sequence_number,
                 max_sequence_number,
                 compaction_level: 1, // compacted result file always have level 1
@@ -1108,16 +1103,16 @@ pub struct PartitionCompactionCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::record_batch::RecordBatch;
     use arrow_util::assert_batches_sorted_eq;
-    use data_types::{ChunkId, KafkaPartition, NamespaceId, ParquetFileParams, SequenceNumber};
+    use data_types::{
+        ChunkId, ColumnSet, KafkaPartition, NamespaceId, ParquetFileParams, SequenceNumber,
+    };
     use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
     use iox_catalog::interface::INITIAL_COMPACTION_LEVEL;
     use iox_tests::util::TestCatalog;
     use iox_time::SystemProvider;
-    use querier::{
-        cache::CatalogCache,
-        chunk::{collect_read_filter, ChunkAdapter},
-    };
+    use parquet_file::{chunk::DecodedParquetFile, ParquetFilePath};
     use schema::sort::SortKey;
     use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -1223,43 +1218,11 @@ mod tests {
 
         // ------------------------------------------------
         // Verify the parquet file content
-        let adapter = ChunkAdapter::new(
-            Arc::new(CatalogCache::new(
-                catalog.catalog(),
-                catalog.time_provider(),
-                catalog.metric_registry(),
-                usize::MAX,
-            )),
-            ParquetStorage::new(catalog.object_store()),
-            catalog.metric_registry(),
-            catalog.time_provider(),
-        );
-        // create chunks for 2 files
-        let files1 = files.pop().unwrap();
-        let files0 = files.pop().unwrap();
-        let chunk_0 = adapter
-            .new_querier_parquet_chunk_from_file_with_metadata(files0)
-            .await
-            .unwrap();
-        let chunk_1 = adapter
-            .new_querier_parquet_chunk_from_file_with_metadata(files1)
-            .await
-            .unwrap();
+        let parquet_storage = ParquetStorage::new(catalog.object_store());
         // query the chunks
-        // least recent compacted first half (~90%)
-        let batches = collect_read_filter(&chunk_0).await;
-        assert_batches_sorted_eq!(
-            &[
-                "+-----------+------+-----------------------------+",
-                "| field_int | tag1 | time                        |",
-                "+-----------+------+-----------------------------+",
-                "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
-                "+-----------+------+-----------------------------+",
-            ],
-            &batches
-        );
         // most recent compacted second half (~10%)
-        let batches = collect_read_filter(&chunk_1).await;
+        let files1 = files.pop().unwrap();
+        let batches = read_parquet_file(&parquet_storage, files1).await;
         assert_batches_sorted_eq!(
             &[
                 "+-----------+------+-----------------------------+",
@@ -1270,6 +1233,20 @@ mod tests {
             ],
             &batches
         );
+        // least recent compacted first half (~90%)
+        let files2 = files.pop().unwrap();
+        let batches = read_parquet_file(&parquet_storage, files2).await;
+        assert_batches_sorted_eq!(
+            &[
+                "+-----------+------+-----------------------------+",
+                "| field_int | tag1 | time                        |",
+                "+-----------+------+-----------------------------+",
+                "| 1000      | WA   | 1970-01-01T00:00:00.000008Z |",
+                "+-----------+------+-----------------------------+",
+            ],
+            &batches
+        );
+        assert!(files.is_empty());
     }
 
     // A quite sophisticated integration test
@@ -1444,31 +1421,25 @@ mod tests {
 
         // ------------------------------------------------
         // Verify the parquet file content
-        let adapter = ChunkAdapter::new(
-            Arc::new(CatalogCache::new(
-                catalog.catalog(),
-                catalog.time_provider(),
-                catalog.metric_registry(),
-                usize::MAX,
-            )),
-            ParquetStorage::new(catalog.object_store()),
-            catalog.metric_registry(),
-            catalog.time_provider(),
-        );
-        // create chunks for 2 files
-        let files2 = files.pop().unwrap();
-        let files1 = files.pop().unwrap();
-        let chunk_0 = adapter
-            .new_querier_parquet_chunk_from_file_with_metadata(files1)
-            .await
-            .unwrap();
-        let chunk_1 = adapter
-            .new_querier_parquet_chunk_from_file_with_metadata(files2)
-            .await
-            .unwrap();
+        let parquet_storage = ParquetStorage::new(catalog.object_store());
         // query the chunks
+        // most recent compacted second half (~10%)
+        let files1 = files.pop().unwrap();
+        let batches = read_parquet_file(&parquet_storage, files1).await;
+        assert_batches_sorted_eq!(
+            &[
+                "+-----------+------+------+------+-----------------------------+",
+                "| field_int | tag1 | tag2 | tag3 | time                        |",
+                "+-----------+------+------+------+-----------------------------+",
+                "| 1600      |      | WA   | 10   | 1970-01-01T00:00:00.000028Z |",
+                "| 20        |      | VT   | 20   | 1970-01-01T00:00:00.000026Z |",
+                "+-----------+------+------+------+-----------------------------+",
+            ],
+            &batches
+        );
         // least recent compacted first half (~90%)
-        let batches = collect_read_filter(&chunk_0).await;
+        let files2 = files.pop().unwrap();
+        let batches = read_parquet_file(&parquet_storage, files2).await;
         assert_batches_sorted_eq!(
             &[
                 "+-----------+------+------+------+-----------------------------+",
@@ -1482,19 +1453,21 @@ mod tests {
             ],
             &batches
         );
-        // most recent compacted second half (~10%)
-        let batches = collect_read_filter(&chunk_1).await;
+        // this is the level 1 data again
+        let files3 = files.pop().unwrap();
+        let batches = read_parquet_file(&parquet_storage, files3).await;
         assert_batches_sorted_eq!(
             &[
-                "+-----------+------+------+------+-----------------------------+",
-                "| field_int | tag1 | tag2 | tag3 | time                        |",
-                "+-----------+------+------+------+-----------------------------+",
-                "| 1600      |      | WA   | 10   | 1970-01-01T00:00:00.000028Z |",
-                "| 20        |      | VT   | 20   | 1970-01-01T00:00:00.000026Z |",
-                "+-----------+------+------+------+-----------------------------+",
+                "+-----------+------+--------------------------------+",
+                "| field_int | tag1 | time                           |",
+                "+-----------+------+--------------------------------+",
+                "| 10        | VT   | 1970-01-01T00:00:00.000000020Z |",
+                "| 1000      | WA   | 1970-01-01T00:00:00.000000010Z |",
+                "+-----------+------+--------------------------------+",
             ],
             &batches
         );
+        assert!(files.is_empty());
     }
 
     #[tokio::test]
@@ -1955,6 +1928,7 @@ mod tests {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL, // level of file of new writes
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         }
     }
 
@@ -2327,9 +2301,7 @@ mod tests {
     }
 
     // This tests
-    //   1. overlapped_groups which focuses on the detail of both its children:
-    //      1.a. group_potential_duplicates that groups files into overlapped groups
-    //      1.b. split_overlapped_groups that splits each overlapped group further to meet size and/or file limit
+    //   1. overlapped_groups
     //   2. group_small_contiguous_groups that merges non-overlapped group into a larger one if they meet size and file limit
     #[test]
     fn test_group_small_contiguous_overlapped_groups_no_group() {
@@ -2588,7 +2560,7 @@ mod tests {
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2607,6 +2579,7 @@ mod tests {
             row_count: 0,
             created_at: Timestamp::new(1),
             compaction_level: INITIAL_COMPACTION_LEVEL,
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
 
         let p2 = ParquetFileParams {
@@ -2792,7 +2765,7 @@ mod tests {
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -2867,8 +2840,8 @@ mod tests {
             parquet_metadata: b"md1".to_vec(),
             compaction_level: INITIAL_COMPACTION_LEVEL, // level of file of new writes
             row_count: 0,
-
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
         let other_parquet = ParquetFileParams {
             object_store_id: Uuid::new_v4(),
@@ -3016,22 +2989,22 @@ mod tests {
             .unwrap();
         let partition = txn
             .partitions()
-            .create_or_get("one", sequencer.id, table.id)
+            .create_or_get("one".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let partition2 = txn
             .partitions()
-            .create_or_get("two", sequencer.id, table.id)
+            .create_or_get("two".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let partition3 = txn
             .partitions()
-            .create_or_get("three", sequencer.id, table.id)
+            .create_or_get("three".into(), sequencer.id, table.id)
             .await
             .unwrap();
         let partition4 = txn
             .partitions()
-            .create_or_get("four", sequencer.id, table.id)
+            .create_or_get("four".into(), sequencer.id, table.id)
             .await
             .unwrap();
 
@@ -3050,6 +3023,7 @@ mod tests {
             row_count: 0,
             compaction_level: INITIAL_COMPACTION_LEVEL, // level of file of new writes
             created_at: Timestamp::new(1),
+            column_set: ColumnSet::new(["col1", "col2"]),
         };
 
         let p2 = ParquetFileParams {
@@ -3200,5 +3174,18 @@ mod tests {
         let mut num_rows: usize = batches[0].iter().map(|rb| rb.num_rows()).sum();
         num_rows += batches[1].iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!(num_rows, 1499);
+    }
+
+    async fn read_parquet_file(
+        storage: &ParquetStorage,
+        file: ParquetFileWithMetadata,
+    ) -> Vec<RecordBatch> {
+        let decoded_parquet_file = DecodedParquetFile::new(file);
+        let schema = decoded_parquet_file.schema();
+        let path: ParquetFilePath = (&decoded_parquet_file.iox_metadata).into();
+        let rx = storage.read_all(schema.as_arrow(), &path).unwrap();
+        datafusion::physical_plan::common::collect(rx)
+            .await
+            .unwrap()
     }
 }

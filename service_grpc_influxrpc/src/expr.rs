@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use std::{convert::TryFrom, fmt};
 
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::binary_expr;
 use datafusion::logical_plan::when;
 use datafusion::{
-    logical_plan::{binary_expr, Expr, Operator},
+    logical_plan::{Expr, Operator},
     prelude::*,
     scalar::ScalarValue,
 };
@@ -27,7 +28,7 @@ use iox_query::{Aggregate as QueryAggregate, WindowDuration};
 use observability_deps::tracing::warn;
 use predicate::{
     rpc_predicate::{InfluxRpcPredicate, FIELD_COLUMN_NAME, MEASUREMENT_COLUMN_NAME},
-    PredicateBuilder,
+    Predicate,
 };
 use snafu::{OptionExt, ResultExt, Snafu};
 
@@ -158,14 +159,14 @@ pub enum GroupByAndAggregate {
 #[derive(Debug, Default)]
 pub struct InfluxRpcPredicateBuilder {
     table_names: Option<BTreeSet<String>>,
-    inner: PredicateBuilder,
+    inner: Predicate,
 }
 
 impl InfluxRpcPredicateBuilder {
     /// Sets the timestamp range
     pub fn set_range(mut self, range: Option<RPCTimestampRange>) -> Self {
         if let Some(range) = range {
-            self.inner = self.inner.timestamp_range(range.start, range.end)
+            self.inner = self.inner.with_range(range.start, range.end)
         }
         self
     }
@@ -239,7 +240,7 @@ impl InfluxRpcPredicateBuilder {
     }
 
     pub fn build(self) -> InfluxRpcPredicate {
-        InfluxRpcPredicate::new(self.table_names, self.inner.build())
+        InfluxRpcPredicate::new(self.table_names, self.inner)
     }
 }
 
@@ -290,7 +291,7 @@ fn normalize_node(node: RPCNode) -> Result<RPCNode> {
     }
 }
 
-/// Converts the node and updates the `PredicateBuilder`
+/// Converts the node and updates the `Predicate`
 /// appropriately
 ///
 /// It recognizes special predicate patterns. If no patterns are
@@ -309,7 +310,7 @@ fn convert_simple_node(
                 // add the table names as a predicate
                 return Ok(builder.tables(value_list));
             } else if tag_name.is_field() {
-                builder.inner = builder.inner.field_columns(value_list);
+                builder.inner = builder.inner.with_field_columns(value_list);
                 return Ok(builder);
             }
         }
@@ -317,7 +318,7 @@ fn convert_simple_node(
 
     // If no special case applies, fall back to generic conversion
     let expr = convert_node_to_expr(node)?;
-    builder.inner = builder.inner.add_expr(expr);
+    builder.inner = builder.inner.with_expr(expr);
 
     Ok(builder)
 }
